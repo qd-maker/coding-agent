@@ -1,0 +1,49 @@
+"""Small modification-aware text cache shared by file tools."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+
+@dataclass(frozen=True, slots=True)
+class _CacheEntry:
+    modified_ns: int
+    size: int
+    content: str
+
+
+class FileCache:
+    """Caches UTF-8 file contents while detecting external changes."""
+
+    def __init__(self) -> None:
+        self._entries: dict[Path, _CacheEntry] = {}
+
+    def get(self, path: str | Path) -> str | None:
+        resolved = Path(path).resolve()
+        entry = self._entries.get(resolved)
+        if entry is None:
+            return None
+        try:
+            stat = resolved.stat()
+        except OSError:
+            self._entries.pop(resolved, None)
+            return None
+        if (stat.st_mtime_ns, stat.st_size) != (entry.modified_ns, entry.size):
+            self._entries.pop(resolved, None)
+            return None
+        return entry.content
+
+    def set(self, path: str | Path, content: str) -> None:
+        resolved = Path(path).resolve()
+        try:
+            stat = resolved.stat()
+        except OSError:
+            return
+        self._entries[resolved] = _CacheEntry(stat.st_mtime_ns, stat.st_size, content)
+
+    def invalidate(self, path: str | Path) -> None:
+        self._entries.pop(Path(path).resolve(), None)
+
+
+__all__ = ["FileCache"]
