@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import locale
 import os
+from pathlib import Path
 from typing import ClassVar
 
 from pydantic import BaseModel, Field
@@ -45,12 +46,24 @@ class Bash(Tool):
     category = "command"
     execution_timeout = MAX_TIMEOUT + 5.0
 
+    def __init__(self, work_dir: str | Path | None = None) -> None:
+        self.work_dir = Path(work_dir).resolve() if work_dir is not None else None
+
+    def set_work_dir(self, work_dir: str | Path) -> None:
+        self.work_dir = Path(work_dir).resolve()
+
     async def execute(self, params: Params) -> ToolResult:
         timeout = min(params.timeout, MAX_TIMEOUT)
         process = await asyncio.create_subprocess_shell(
             params.command,
+            # An agent has no way to feed interactive input, so detach stdin.
+            # Without this, a command that reads stdin (a stdio MCP server, an
+            # interactive REPL/prompt, a pager) inherits the terminal and blocks
+            # until the timeout. DEVNULL delivers immediate EOF instead.
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            cwd=str(self.work_dir) if self.work_dir is not None else None,
         )
         try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
@@ -63,6 +76,7 @@ class Bash(Tool):
             return ToolResult(
                 f"Error: command timed out after {timeout:g}s",
                 is_error=True,
+                exit_code=-1,
             )
         except asyncio.CancelledError:
             process.kill()
@@ -83,7 +97,13 @@ class Bash(Tool):
         returncode = int(process.returncode or 0)
         if returncode != 0:
             output = f"{output}\n\nExit code: {returncode}"
-        return ToolResult(output, is_error=returncode != 0)
+        return ToolResult(
+            output,
+            is_error=returncode != 0,
+            data={"command": params.command, "exit_code": returncode},
+            preview=output[:2000],
+            exit_code=returncode,
+        )
 
 
 __all__ = ["Bash", "MAX_TIMEOUT", "Params", "_decode_output"]

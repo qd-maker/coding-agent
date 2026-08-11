@@ -3,11 +3,12 @@
 **一个从零搭建的终端 Coding Agent MVP。**
 
 MewCode 使用 Python + Textual 实现，将模型流式输出、结构化工具调用、Agent Loop、
-上下文回灌、System Prompt 和权限控制串成一条可运行、可观察、可测试的执行链路。
+上下文回灌、System Prompt、权限控制和跨会话持久化串成一条可运行、可观察、可测试的执行链路。
 
-> 当前完成并验收的是 **CH2–CH6**：Provider 与对话管理、工具系统、Agent Loop、
-> System Prompt、权限系统。MCP、长期记忆、完整 Skill/SubAgent/Worktree/AgentTeam 等能力仍在 Roadmap，
-> 不作为现成功能展示。
+> 当前完成并验收的是 **CH2–CH15**：Provider 与对话管理、工具系统、Agent Loop、
+> System Prompt、权限系统、MCP 外部工具接入、两层上下文管理，以及项目指令、会话存档和
+> 自动记忆、统一 Slash Command、两阶段 Skill、Hook 生命周期自动化，以及可定义、可 Fork、
+> 可后台运行的 SubAgent、Git Worktree 隔离执行，以及可持久化、可恢复、可合并的 AgentTeam。
 
 ## 界面预览
 
@@ -48,10 +49,17 @@ Accept Edits 是默认执行模式。文件写入和编辑可以直接完成；�
 | Provider 与流式对话 | ✅ | Anthropic Messages API、OpenAI Responses API、统一异步事件、Extended Thinking、多轮对话 |
 | 工具系统 | ✅ | 统一 `Tool` Contract、Pydantic 参数校验、内置文件/搜索/Bash 工具、结构化错误 |
 | Agent Loop | ✅ | 工具调用收集、执行、结果回灌、自动进入下一轮、串并行批次、最大轮次与取消 |
-| 上下文基础治理 | ✅ | token 预算、自动压缩、超长工具结果落盘、模型可见结果预览 |
+| 两层上下文管理 | ✅ | 本地 Token 估算、大结果落盘与预览、自动结构化摘要、恢复附件、`/compact` 前后对比 |
 | System Prompt | ✅ | 分区 Prompt Builder、环境上下文、普通/协调/Plan 身份约束、动态 reminder |
 | 权限系统 | ✅ | 危险命令检测、路径沙箱、三层 YAML 规则、HITL、Plan 豁免、三种 TUI 模式 |
-| MCP / 长期记忆 / 完整 Skill / SubAgent / Worktree / AgentTeam | ⏳ | 后续规划，不属于当前完成范围 |
+| MCP Protocol | ✅ | stdio / Streamable HTTP、并行连接、启动/调用超时、部分失败隔离、动态 Tool Wrapper、ToolSearch 延迟发现 |
+| 指令、会话与自动记忆 | ✅ | 三层 `MEWCODE.md`、安全 `@include`、崩溃安全 JSONL、链路校验、双层 `memories.md`、`/session`、`/memory` |
+| Slash Command | ✅ | Registry/Parser/UIController、内置与动态命令、命令优先拦截、Tab 补全、状态栏提示 |
+| Skill 系统 | ✅ | YAML+Markdown、三级覆盖、热加载、inline/fork、LoadSkill、工具白名单、目录能力包、动态短命令 |
+| Hook 系统 | ✅ | 15 个生命周期事件、条件 DSL、command/prompt/http、once/async/timeout、pre-tool 拦截与 YAML 校验 |
+| SubAgent 系统 | ✅ | 四级 Agent 定义、统一 Agent 工具、上下文 Fork、RunToCompletion、多层工具过滤、后台任务、Trace 与 Slash Command |
+| Git Worktree 隔离 | ✅ | 安全命名、完整生命周期、dirty/unpushed 保护、崩溃恢复、过期清理、SubAgent 自动隔离、`/worktree` |
+| AgentTeam | ✅ | Lead/成员、协程与 pane 后端、共享任务、磁盘邮箱、空闲恢复、事务合并、纯调度双锁与 `/team` |
 
 ## Agent 如何工作
 
@@ -69,6 +77,14 @@ flowchart LR
     H -->|"PermissionResponse"| A
     T -->|"ToolResult"| C
     C -->|"next model turn"| A
+    C --> S["JSONL Session Archive"]
+    A --> M["Automatic Memory Extractor"]
+    M --> C
+    A --> W["Git Worktree Isolation"]
+    W --> T
+    A --> G["Persistent AgentTeam"]
+    G --> Q["Shared Tasks / Mailboxes"]
+    G --> W
 ```
 
 一次完整工具闭环：
@@ -91,6 +107,8 @@ flowchart LR
 - **Agent Loop**：管理模型与工具之间的循环、停止条件、错误恢复、并发和上下文预算。
 - **ToolRegistry**：统一工具 schema、参数模型、类别、并发属性与执行入口。
 - **PermissionChecker**：在模型之外处理危险命令、路径范围、规则、模式和用户确认。
+- **Memory / Session**：加载分层项目指令与记忆，追加保存 JSONL，并在恢复时校验工具消息链。
+- **SubAgent Runtime**：隔离对话和权限状态，管理定义式/Fork 路径、后台任务、异步通知与成本追踪。
 - **Textual TUI**：消费 Agent 事件，展示流式回答、思考、工具状态和内联交互。
 
 ## 内置工具
@@ -106,9 +124,10 @@ flowchart LR
 | `ToolSearch` | read | 按需发现延迟注册工具 |
 | `AskUserQuestion` | read | 在 Agent Loop 中发起结构化用户问题 |
 | `WritePlan` | plan only | 仅在 Plan 模式写入当前计划文件 |
+| `Agent` | command | 启动定义式子 Agent，或 Fork 当前完整上下文并在后台执行 |
 
 工具失败会作为结构化结果返回模型，不会直接终止 TUI。超长结果保存在
-`.mewcode/sessions/`，只把结果预览和文件位置回灌给模型；声明为并发安全的相邻只读工具可
+`.mewcode/session/tool-results/`，只把结果预览和文件位置回灌给模型；声明为并发安全的相邻只读工具可
 并行执行。
 
 ## 三种执行模式
@@ -156,27 +175,46 @@ $env:ANTHROPIC_API_KEY = "your-key"
 默认配置示例：
 
 ```yaml
-provider:
-  name: default
-  protocol: anthropic
-  model: claude-sonnet-4-6
-  base_url: https://api.anthropic.com
-  api_key: ${ANTHROPIC_API_KEY}
-  thinking: true
+providers:
+  - name: anthropic-official
+    protocol: anthropic
+    base_url: https://api.anthropic.com
+    api_key: ${ANTHROPIC_API_KEY}
+    model: claude-sonnet-4-6
+    thinking: true
 
 system_prompt: You are MewCode, a concise and helpful coding assistant.
+
+mcp_servers:
+  - name: context7
+    command: npx
+    args: ["-y", "@upstash/context7-mcp"]
+    startup_timeout: 20
+    tool_timeout: 120
+  # - name: remote_tools
+  #   url: https://mcp.example.com/mcp
+  #   headers:
+  #     Authorization: Bearer ${REMOTE_MCP_TOKEN}
 ```
+
+`providers` 中第一项是当前活动 Provider。MCP 配置为列表且每项显式声明 `name`；每个
+server 只能选择 `command`（stdio）或 `url`
+（Streamable HTTP）。MCP 工具按 `mcp_<server>_<tool>` 注册（远端名称中的 `-` 等字符会规范化为 `_`）并默认延迟加载，Agent 会先用
+`ToolSearch` 发现所需工具。stdio 子进程只继承 `PATH`、Windows 启动所需的最小运行时变量
+以及配置中显式声明的 `env`，避免泄漏宿主机 API key。Context7 stdio 示例需要本机安装
+Node.js / `npx`。多个 MCP Server 并行启动；`startup_timeout` 约束连接和工具枚举，
+`tool_timeout` 约束单次工具调用，单个服务失败不会阻断其他服务。
 
 OpenAI 兼容配置：
 
 ```yaml
-provider:
-  name: default
-  protocol: openai
-  model: gpt-5.5
-  base_url: https://api.openai.com/v1
-  api_key: ${OPENAI_API_KEY}
-  thinking: false
+providers:
+  - name: openai-official
+    protocol: openai
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_API_KEY}
+    model: gpt-5.5
+    thinking: false
 ```
 
 配置发现顺序：当前目录的 `mewcode.yaml`，然后是 `~/.mewcode/config.yaml`。也可以使用
@@ -188,7 +226,30 @@ provider:
 uv run mewcode
 # 或
 uv run python -m mewcode
+
+# 非交互模式（同样加载 MCP/Hook，并保存有效会话）
+uv run mewcode -p "解释这个项目的入口"
 ```
+
+### 4. 可选：项目指令与持久记忆
+
+在项目根目录创建 `MEWCODE.md`，可记录技术栈、编码规范和项目注意事项：
+
+```markdown
+# Project Instructions
+
+- 修改接口前先更新 API Contract。
+- 完成后运行 ruff、mypy 和 pytest。
+@include ./docs/coding-style.md
+```
+
+MewCode 按 `<project>/MEWCODE.md` → `<project>/.mewcode/MEWCODE.md` →
+`~/.mewcode/MEWCODE.md` 的顺序加载。`@include` 最多递归 5 层，且不能跳出项目目录。
+
+会话消息追加保存到 `<project>/.mewcode/sessions/*.jsonl`，摘要和消息数保存在同名 `.meta`
+文件。自动记忆分开写入 `~/.mewcode/memories.md`（用户偏好、纠正反馈）与
+`<project>/.mewcode/memories.md`（项目知识、参考资料）。这些运行时文件已被 `.gitignore`
+忽略。
 
 ## 为什么采用 spec / tasks / checklist
 
@@ -206,7 +267,8 @@ checklist.md 把“完成”转换成可搜索、可运行、可观察的验收�
 完成了”的错误判断。
 
 章节状态和三件套索引位于 [`docs/README.md`](docs/README.md)；更完整的学习复盘见
-[`docs/learning-notes.md`](docs/learning-notes.md)。
+[`docs/learning-notes.md`](docs/learning-notes.md)，最终完整性、性能和付费 API 证据见
+[`docs/final-audit.md`](docs/final-audit.md)。
 
 ## 关于“AI 项目最大的坑”
 
@@ -235,11 +297,13 @@ uv run pytest -q
 当前回归结果：
 
 ```text
-167 passed, 1 skipped
+497 passed, 1 skipped
 ```
 
 跳过项是 Windows 未授予符号链接创建权限时的 symlink escape 测试；其余 Provider、对话、
-工具、Agent Loop、Prompt、权限系统和 TUI 用例均执行。
+工具、Agent Loop、Prompt、权限系统、上下文、记忆持久化、Slash Command、Skill、Hook、SubAgent、
+Worktree、AgentTeam 和 TUI
+用例均执行。
 
 ## 项目结构
 
@@ -248,33 +312,34 @@ mewcode/
 ├── agent.py              # Agent Loop、事件、工具执行与恢复
 ├── client.py             # Anthropic / OpenAI Provider Adapter
 ├── conversation.py       # Provider-neutral 对话与工具块
-├── context.py            # token 预算、压缩、超长结果落盘
+├── context/              # Token 估算、两层压缩、落盘与压缩后恢复
+├── memory/               # MEWCODE.md、JSONL 会话与自动记忆
 ├── prompts.py            # System Prompt Builder
 ├── app.py                # Textual TUI
+├── commands/             # Registry、Parser、补全组件与本地/动态命令
+├── skills/               # Skill 解析、三级加载、inline/fork、目录工具与三个内置 SOP
+├── hooks/                # 生命周期事件、条件、Action 执行器、YAML loader 与 HookEngine
+├── agents/               # Agent 定义、四级加载、Fork、过滤、后台任务、通知与 Trace
+├── worktree/             # Git worktree 生命周期、恢复、保护、初始化与过期清理
+├── teams/                # 持久化团队、共享任务、磁盘邮箱、后端、transcript 与合并
+├── mcp/                  # MCP client、manager 与 Tool wrapper
 ├── permission_dialog.py  # AskUser / 权限内联交互
 ├── permissions/          # 模式、危险检测、路径沙箱、规则、Checker
 └── tools/                # Tool Contract 与内置工具
 
 docs/
 ├── api-contract.md
-├── ch2/ ... ch6/         # spec / tasks / checklist
+├── ch2/ ... ch15/        # spec / tasks / checklist
 ├── assets/               # 真实运行截图
 └── learning-notes.md
 ```
 
 ## Roadmap（尚未完成）
 
-- CH7：MCP 协议与外部工具接入
-- CH8：项目级上下文选择与管理
-- CH9：可解释、可删除、可验证的跨会话记忆
-- CH10：完整 Slash Command 系统
-- CH11：可发现、可装载、可约束的 Skill 系统
-- CH12：完整 Hook 生命周期和配置体验
-- CH13：SubAgent 调度、隔离和结果合并
-- CH14：Git Worktree 隔离执行
-- CH15：长期协作 AgentTeam、Mailbox 与共享任务
+- 跨主机团队调度、远程队列与分布式锁
+- Agent/Skill 市场与版本化分发
 
-仓库中的实验性脚手架不代表上述章节已达到 CH2–CH6 相同的完成与验收标准。
+仓库中的后续实验性脚手架不代表其已达到 CH2–CH15 相同的完成与验收标准。
 
 ## 操作提示
 
@@ -282,6 +347,25 @@ docs/
 - `/plan`：进入 Plan 模式。
 - `/do`：返回 Accept Edits。
 - `/mode yolo`：进入 YOLO。
+- `/compact`（或 `/c`）：手动生成结构化摘要，并显示压缩前后的 Token 估算。
+- `/session list`：查看最近会话；`resume <id|序号>`、`new`、`delete <id>` 管理存档。
+- `/memory`：查看自动记忆；`/memory clear` 清空；`/memory edit` 显示双层文件路径。
+- `/help`：列出内置命令；输入 `/` 后按 Tab 可补全。
+- `/status`：查看模式、会话、Token、工具、记忆、工作目录和版本。
+- `/permission`：查看或修改权限模式和本地规则。
+- `/commit [范围]`：激活 inline commit SOP，在主对话内检查、提交并验证变更。
+- `/review [关注点]`：在隔离 fork 中执行 review Skill，结果摘要回流主界面。
+- `/test [范围]`：识别项目类型并执行对应测试 SOP。
+- `/skill list|info|reload`：查看来源和详情，或重新扫描 Skill 目录。
+- `/tasks`：列出后台 SubAgent；`/task info <id>` 查看结果；`/task cancel <id>` 取消。
+- `/trace [trace-id]`：查看 SubAgent 父子链路与 Token 汇总。
+- `/worktree create <name> [base]`：创建并进入独立 Git worktree；`list/enter/status` 管理目录。
+- `/worktree exit [--remove] [--discard]`：默认保留；删除前保护未提交和未推送工作。
+- `/team create <name>`：创建长期团队；`list/status/tasks/merge/stop/delete` 管理成员和工作。
+- `Agent` 工具携带 `team_name` 和 `name` 时，会在独立 worktree 中启动可恢复 teammate。
+- `teammate_mode: in-process` 适合跨平台演示；tmux/iTerm2 模式使用独立 CLI pane 强隔离。
+- `mewcode --resume`：进程中断后恢复上次活动的 worktree session。
+- 子 Agent 前台运行时按 `Esc`：把原实例切换到后台，不终止重跑。
 - `Ctrl+O`：展开或收起 Extended Thinking。
 - 生成期间按一次 `Ctrl+C`：取消当前回复。
 - 空闲时 1.5 秒内连续按两次 `Ctrl+C`：退出。

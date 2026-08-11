@@ -1,62 +1,63 @@
-# ch10: Slash Command Spec
+# CH10：Slash Command Spec
 
 ## 1. 背景
 
-TUI 需要一种快捷方式让用户在不打扰主对话的前提下触发本地操作（清屏、切换 Plan/Do 模式、查看 token 状态、操作 session 与记忆），以及调用既定 prompt 模板。直接把这些诉求丢给 LLM 既浪费 token，也无法即时改变 UI 状态（清屏、Plan 模式开关、permission 切换都不是 LLM 能完成的）。Slash Command 把所有以 `/` 开头的输入收编成命名空间，统一注册、补全、解析、分发；缺少这层框架，要么 if/elif 散落，要么所有动作走 Agent Loop，体验和成本都不可接受。
+TUI 中的清屏、模式切换、上下文压缩、会话/记忆管理等操作不应发送给 LLM。否则既浪费
+Token，又无法可靠修改本地 UI 状态。CH10 用统一的 Slash Command 命名空间替换散落在
+`on_input_submitted` 中的 `if/elif`，并保留一类可把模板化提示词重新送入 Agent Loop 的命令。
 
-## 2. 目标
+## 2. 目标与范围
 
-交付进程内的 `CommandRegistry`，让 TUI 在用户敲 `/<name> [args]` 时按统一签名调起 handler。内置 help / clear / compact / plan / do / session / memory / permission / status / skill / review / tasks / trace / worktree 等核心命令；每个命令声明 `type ∈ {LOCAL, LOCAL_UI, PROMPT}`，框架据此决定走系统消息回显、UI 状态改写，还是把 prompt 当成 user message 投回 Agent。Skill 系统在 provider 就绪后把每个 skill 注册为 `PROMPT` 类型命令；TUI 在输入框响应 `/` 时实时弹补全菜单。
+实现命令模型、集中式注册中心、解析器、补全器和 UI 抽象；TUI 必须在 Agent 调用前拦截
+`/` 命令，支持 Tab 补全并在状态栏展示高频命令提示。
+
+本章只交付十个内置命令：`help`、`compact`、`clear`、`plan`、`do`、`session`、
+`memory`、`permission`、`status`、`review`。Skill、Hook、SubAgent、Task、Trace、
+Worktree 属于后续章节，不作为 CH10 已完成功能。
 
 ## 3. 功能需求
 
-- F1: `CommandRegistry` 暴露 `register / register_sync / find / list_commands` 四个方法，并维护 alias → canonical name 投射；冲突时抛 `ValueError`。
-- F2: 三类命令类型由 `CommandType` 枚举：`LOCAL`（handler 显示系统消息）、`LOCAL_UI`（handler 改写 UI 状态，例如清屏 / 切 Plan）、`PROMPT`（handler 调用 `ui.send_user_message`，转给 Agent 当用户消息发出）。
-- F3: `parse_command(text)` 把 `/foo bar baz` 拆为 `(name, args, is_command)`：非 `/` 前缀返回 `("", "", False)`；只有 `/` 返回 `("", "", True)`；name 自动小写化。
-- F4: `register_all_commands(registry)` 一次性注册 10 个内置命令（help / compact / clear / plan / do / session / memory / permission / status / skill）；其余命令（review / tasks / trace / worktree）由 app 在依赖就绪后通过工厂函数注册。
-- F5: `complete(registry, prefix)` 接受 `/abc` 形式前缀，遍历所有非 hidden 命令的 name 与 aliases，按字典序返回所有匹配 `"/" + name` 字符串列表。
-- F6: `CommandContext` 是 handler 唯一入参，必须承载 `args / agent / conversation / session / session_manager / memory_manager / ui / config`；`config` 是 dict，托管 registry、skill_loader、skill_executor 等需要回写的闭包钩子。
-- F7: `UIController` 协议固定 `add_system_message / send_user_message / set_plan_mode / get_token_count / refresh_status` 五个方法，handler 只通过它跟 UI 交互。
-- F8: TUI 监听 `/` 前缀输入：`Tab` 触发 `complete` → `CompletionPopup.show`；`Enter` 走 `_dispatch_command` → `parse_command` → `registry.find` → `cmd.handler(ctx)`。
+- F1：`CommandRegistry` 提供 `register`、`register_sync`、`find`、`list_commands`；名称和
+  别名大小写不敏感，名称/别名发生任意交叉冲突时抛 `ValueError`。
+- F2：`CommandType` 包含 `LOCAL`、`LOCAL_UI`、`PROMPT`：分别表示本地回显、修改 UI
+  状态，以及把预设提示词交给正常对话流。
+- F3：`CommandContext` 是 handler 的唯一入参，固定包含 `args`、`agent`、
+  `conversation`、`session`、`session_manager`、`memory_manager`、`ui`、`config`。
+- F4：`UIController` 固定暴露 `add_system_message`、`send_user_message`、`set_plan_mode`、
+  `get_token_count`、`refresh_status`，命令不得依赖 Textual 组件。
+- F5：`parse_command(text)` 返回 `(name, args, is_command)`；支持前导空白、纯 `/`、
+  多参数和大小写归一化，且不因异常输入抛错。
+- F6：`complete(registry, prefix)` 对非隐藏命令的 canonical name 与 alias 做前缀匹配，
+  返回排序、去重后的 `/<candidate>` 列表。
+- F7：`register_all_commands` 一次性注册且只注册本章的十个内置命令。
+- F8：`/help [name]` 从 Registry 元数据生成列表或详情；未知命令统一引导到 `/help`。
+- F9：`/plan [prompt]`、`/do [prompt]` 先切模式，再可选地把参数送入 Agent Loop。
+- F10：`/review [focus]` 发送固定审查模板，至少覆盖逻辑错误、安全、性能和代码风格；
+  参数追加为“额外关注”。
+- F11：`/session` 支持 `list/resume/new/delete`；`/memory` 支持 `list/clear/edit`；
+  `/permission` 支持模式、规则查看、追加与本地规则重置。
+- F12：TUI 的 Enter 分流顺序固定为：解析命令 → 本地分发 → 非命令才调用 Agent。
+- F13：Tab 单命中直接回填，多命中展示 `CompletionPopup` 并可选择回填。
+- F14：状态栏显示 `/help`、`/status` 与 Tab 补全提示，并继续显示当前权限模式。
 
 ## 4. 非功能需求
 
-- N1: `CommandRegistry.register` 默认禁止冲突，重复 name / alias 抛 `ValueError`；后续 skill 热重载需要先从 `_commands / _alias_map` 主动剔除旧条目。
-- N2: `parse_command` 不能抛异常：空串、`/`、连续空格、前导空格、纯空白都要返回稳定 3 元组。
-- N3: `CommandRegistry` 在异步路径使用 `asyncio.Lock` 保护并发注册（为 skill 热重载预留）。
-- N4: handler 是 `async` 函数，签名只依赖 `CommandContext`；`mewcode.commands` 包不 import TUI 内部模块，反向依赖通过 `config` dict 注入闭包。
-- N5: handler 抛异常时由调用方（`_dispatch_command`）捕获并以系统消息形式反馈，单条命令失败不能把 TUI 拉崩。
+- N1：异步注册由 `asyncio.Lock` 串行化；同步注册适用于应用启动装配。
+- N2：所有 handler 为 `async def handler(ctx) -> None`，结果通过 `UIController` 输出。
+- N3：命令包不 import `mewcode.app`；需要的 App 副作用通过 `config` 回调注入。
+- N4：单条命令异常由 `_dispatch_command` 捕获并显示，不能让 TUI 崩溃。
+- N5：hidden 命令可查找、可执行，但不出现在普通列表和补全结果中。
+- N6：不实现 fuzzy match、命令管道、Markdown 命令加载和热重载。
 
-## 5. 设计概要
+## 5. 设计与调用链
 
-- 核心数据结构：
-  - `mewcode.commands.registry.CommandType`：枚举 `LOCAL / LOCAL_UI / PROMPT`
-  - `mewcode.commands.registry.Command`：name / description / type / handler / aliases / usage / arg_prompt / hidden
-  - `mewcode.commands.registry.CommandRegistry`：`_commands` dict + `_alias_map` dict + `asyncio.Lock`
-  - `mewcode.commands.registry.CommandContext`：args / agent / conversation / session / session_manager / memory_manager / ui / config
-  - `mewcode.commands.registry.UIController`：`Protocol`，规定 5 个 UI 方法
-- 主流程：
-  1. `MewCodeApp.__init__` → `self.command_registry = CommandRegistry()` → `register_all_commands(self.command_registry)` 装 10 个内置命令
-  2. provider 就绪 → 注册 worktree / tasks / trace 等带依赖的命令 → `register_skill_commands` 把 skill catalog 注册为 `PROMPT` 命令
-  3. 用户敲 `/` → `on_chat_input_tab_complete` → `complete(registry, prefix)` → 单命中 inline 填回，多命中弹 `CompletionPopup`
-  4. 用户回车 → `on_chat_input_submitted` → `_dispatch_command(text)` → `parse_command` → `registry.find` → 构造 `CommandContext` → `await cmd.handler(ctx)`
-  5. handler 按 type 行为分化：`LOCAL` 调 `ui.add_system_message`；`LOCAL_UI` 触发 `set_plan_mode` / `clear_chat` / `set_session` 等 UI 副作用；`PROMPT` 调 `ui.send_user_message` 把构造好的 prompt 发回 Agent
-- 调用链（模块层级）：
-  - `/status` → `MewCodeApp._dispatch_command` → `parse_command` → `registry.find("status")` → `handle_status(ctx)` → `ctx.ui.add_system_message`
-  - `/review fix race condition` → 同样路径 → `handle_review` 拼出 `REVIEW_PROMPT + 额外关注` → `ctx.ui.send_user_message` → 进入 Agent Loop
-  - `/<skill_name>` → handler 由 `register_skill_commands.make_handler` 闭包构造 → 调 `SkillExecutor.execute_inline / execute_fork`
-- 与其他模块的交互：
-  - 上行依赖：`MewCodeApp`（注册、补全、分发）、`SkillLoader`（每个 skill 注册成命令）、`WorktreeManager` / `TaskManager` / `TraceManager`（工厂函数注入依赖）
-  - 下行：纯接口包，仅 import `mewcode.conversation` / `mewcode.permissions` / `mewcode.memory.session` 等数据模型；不 import 任何 UI / agent 实现
+1. `MewCodeApp.__init__` 创建 `CommandRegistry`，调用 `register_all_commands`。
+2. 用户回车后 `on_input_submitted` 先调用 `_dispatch_command`。
+3. `_dispatch_command` 执行 `parse_command → registry.find → CommandContext → handler`。
+4. LOCAL/LOCAL_UI handler 经 `add_system_message` 回显；PROMPT handler 经
+   `send_user_message` 重新进入 `_stream_reply → Agent.run`。
+5. 用户按 Tab 后执行 `complete`：单命中写回 Input，多命中交给 `CompletionPopup`。
 
-## 6. Out of Scope
+## 6. 完成定义
 
-- 命令级权限过滤（命令是否能用由调用方决定，框架不裁剪）
-- 文件式 markdown 命令加载（Python 版尚未实现 `LoadDir` / 三层目录合并，由后续章节追加）
-- 命令链式调用 / 管道（`/a | /b` 不支持）
-- 命令的 fuzzy match（`complete` 只做前缀匹配）
-- markdown 命令的文件 watcher / 热更新
-
-## 7. 完成定义
-
-见 [checklist.md](checklist.md)，所有条目勾上即完成。
+以 [checklist.md](checklist.md) 为准；实现、真实 TUI 调用链、自动测试和静态检查必须同时通过。

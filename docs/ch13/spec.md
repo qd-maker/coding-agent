@@ -1,79 +1,147 @@
-# ch13: SubAgent Spec
+# CH13：SubAgent 系统 Spec
 
 ## 1. 背景
 
-主 Agent 做大任务时会塞满上下文：研究、规划、写代码、跑测试都堆在一个对话里，单一窗口很快耗尽。这一章把"开一个上下文隔离的新 Agent 去做一件事"做成主 Agent 可以直接调用的工具，让主 Agent 学会分发工作，避免上下文污染，同时通过专门角色（Plan / Explore）和后台异步执行扩展并发能力。
+主 Agent 同时承担探索、规划、实现和验证时，对话会被大量中间信息污染。CH13 增加可定义、可
+隔离、可后台运行的子 Agent，让主 Agent 只接收结构化结果，同时保留取消、成本和调用链证据。
 
 ## 2. 目标
 
-提供 `Agent` 工具，主 Agent 在对话里写一次工具调用即可：1) 按 `subagent_type` 启动一个定义式专家子 Agent（系统提示词、模型、工具白名单都按 Markdown 定义文件来），2) 不带 `subagent_type` 且 `enable_fork=true` 时直接 fork 当前对话上下文跑一个临时子 Agent，3) 带 `team_name` 时把这个 spawn 注册成长期团队成员（衔接 ch15）。后台任务的完成通过 `<task-notification>` 反馈给主 Agent。
+- 用一个稳定的 `Agent` 工具统一定义式 Agent 与上下文 Fork。
+- 定义式 Agent 使用独立对话、工具池、权限状态、文件缓存和 Token 计数。
+- Fork 深拷贝父 Agent 完整历史并复用客户端、system prompt、Hook 和消息前缀，支持 prompt cache。
+- 后台任务不阻塞当前对话，完成后通过 `<task-notification>` 异步回流。
+- 使用多层工具过滤和禁止嵌套 Fork，避免递归失控。
 
-## 3. 功能需求
+## 3. API Contract
 
-- F1: `AgentTool` 继承 `mewcode.tools.base.Tool`，注册到主 Agent 的 `ToolRegistry`，被 LLM 当成普通工具调用。
-- F2: 三档内建 Agent 类型 `general-purpose` / `Plan` / `Explore`，每档可定制工具黑名单、最大轮数、模型、系统提示词。
-- F3: 支持从用户级目录 `~/.mewcode/agents/*.md` 和项目级 `<work_dir>/.mewcode/agents/*.md` 加载自定义 Agent 定义；项目级覆盖用户级覆盖 builtin；Markdown frontmatter 解析为 `AgentDef`。
-- F4: 三种执行路径：sync（前台阻塞、`await sub_agent.run_to_completion()`）/ background（asyncio task，立即返回任务 ID）/ fork（fork 父对话上下文，强制后台）。
-- F5: `TaskManager` 跟踪后台子 Agent 生命周期（running / completed / failed / cancelled），完成时把任务 ID 写进 `asyncio.Queue`，主 Agent 下一轮通过 `poll_completed` 拿到，再用 `inject_task_notifications` 拼装 `<task-notification>` 注入对话。
-- F6: 四层工具过滤：MCP 直通、全局禁（`ALL_AGENT_DISALLOWED_TOOLS` 七项，含 `Agent` / `AskUserQuestion` 防递归）、custom agent（`source != "builtin"`）额外禁、background 白名单（`ASYNC_AGENT_ALLOWED_TOOLS` 16 项）、definition 级 `disallowed_tools` + `tools` 白名单。
-- F7: Fork 路径：构造完整 forked `ConversationManager`（`copy.deepcopy(history)` + 给悬挂的 `tool_use` 补 `"interrupted"` placeholder `ToolResultBlock`），追加 `FORK_BOILERPLATE` + `"你的任务：\n" + task`；fork-of-fork 通过扫描对话历史 `FORK_BOILERPLATE_TAG` 拒绝。
-- F8: 可选 worktree 隔离与 `WorktreeManager` 配合，子 Agent 在临时 git worktree 中跑；执行结束按 `auto_cleanup` 返回的 `kept` 标志决定是否在结果里追加 `[Worktree preserved at ...]` 提示。
-- F9: 可选团队模式与 `TeamManager` 配合，走 `_execute_as_teammate` 路径注册长期团队成员，按 backend（in-process / tmux / iterm2）路由（详见 ch15）。
-- F10: 父 Agent 取消（中断）时，`TaskManager.adopt_running` 把当前正在跑的 Agent 实例挂为后台任务并继续执行，主流程不阻塞。
-- F11: `AgentTool` 入口额外支持 `model`（运行时模型覆盖）/ `isolation`（仅 `worktree`）/ `name`（团队场景标识）参数；`isolation` 与 `team_name` 互斥（团队场景走自己的 worktree）。
-- F12: 子 Agent 定义 frontmatter 可声明 `background: true` 强制后台运行，与调用侧 `run_in_background=true` 等价。
-- F13: 可选 Verification 内置角色（找最后 20% bug），由 `enable_verification` flag 守开关；默认不出现在 Agent 列表里。
-- F14: Fork 子 Agent 的工具池继承父池经四层过滤（MCP 直通 + 全局黑 + 白名单 + 定义级），让 API 请求前缀字节级一致以命中 prompt cache；嵌套 fork 通过扫描父对话消息内容 `FORK_BOILERPLATE_TAG` 阻止。
-- F15: Fork 复制父对话用 `copy.deepcopy`，保留每条 `Message` 的全部字段（含 `tool_uses` / `tool_results` / `thinking`），保证 assistant 消息形状与父侧一致。
-- F16: 子 Agent 接受 spec 级 `permission_mode` 覆盖，运行时用独立的 `PermissionChecker`，与父共享 `DangerousCommandDetector` / `RuleEngine` 类型，但 `PathSandbox` 按子 Agent 的 `work_dir` 重新分配。
-- F17: `TraceManager` 给每个 spawn 出来的子 Agent 创建 `TraceNode`，父 / 子 / trace ID 三元组打通，配合 `trace` 命令做调用树查询。
+完整请求、响应与错误语义见 [`../api-contract.md`](../api-contract.md#12-subagent-contract)。
 
-## 4. 非功能需求
+### Agent 定义
 
-- N1: 子 Agent 不能再调 `Agent` 工具（防止无限递归 / 上下文爆炸），任意层级的子 Agent 都通过 `ALL_AGENT_DISALLOWED_TOOLS` 屏蔽。
-- N2: 后台 Agent 通过 `asyncio.Task.cancel()` 受控；取消调用后状态置为 `cancelled`。
-- N3: `TaskManager` 在 asyncio 单线程模型下顺序安全，`_tasks` / `_async_tasks` / `_notify_queue` 必须在事件循环内访问。
-- N4: fork 操作必须先在父对话历史里扫 `FORK_BOILERPLATE_TAG` 字面量，命中即 `raise ForkError`。
-- N5: Sync 路径要 `await` 子 Agent 的 `run_to_completion` 直到返回，不丢消息；异常路径要把 `trace_node` 标 `failed` 再向上抛。
-- N6: Fork 子 Agent 必须复用父池工具与对话内容（含 thinking blocks），让请求前缀字节级一致；任何额外过滤都会破坏 prompt cache 命中。
-- N7: 子 Agent 的 `PermissionChecker` 必须独立实例，不能直接共享父引用，`permission_mode` 覆盖时不允许污染父的权限状态。
-- N8: `AgentDef` frontmatter 接受的字段集合在解析层完整保留：未来章节（hooks / mcpServers / skills / memory 等）的字段必须在解析层先存得下，避免重复迁移；当前已落地 `name / description / tools / disallowedTools / model / maxTurns / permissionMode / background / isolation`。
+Agent 文件使用 YAML frontmatter + Markdown body：
 
-## 5. 设计概要
+```yaml
+---
+name: Explore
+description: Fast read-only codebase exploration.
+model: haiku
+maxTurns: 30
+permissionMode: dontAsk
+tools: [ReadFile, Glob, Grep, Bash, ToolSearch]
+disallowedTools: [Agent, EditFile, WriteFile]
+background: false
+---
+Markdown system prompt
+```
 
-- 核心数据结构：
-  - `AgentTool`：承载 `AgentLoader / TaskManager / TraceManager / parent_agent / provider_config / worktree_manager / team_manager / enable_fork` 等运行时依赖。
-  - `AgentDef`：Markdown frontmatter 解出来的 dataclass，含 `agent_type / when_to_use / system_prompt / tools / disallowed_tools / model / max_turns / permission_mode / background / isolation / file_path / source`。
-  - `AgentToolParams`：pydantic 模型，对应 `Agent` 工具的入参 schema（`prompt / description / subagent_type / model / run_in_background / name / isolation / team_name`）。
-  - `TaskManager` / `BackgroundTask` / `ProgressInfo`：后台任务的状态机 + `asyncio.Queue` 通知。
-  - `TraceManager` / `TraceNode`：父子 / trace 三元组追踪，token / 状态 / 时间。
-  - 工具过滤层：四张 frozenset 控制四层过滤（MCP 豁免 → 全局禁用 → 自定义额外禁用 → 异步白名单 → 定义级黑名单 + 白名单）。
-- 主流程：
-  - 同步：用户消息 → 主 Agent → LLM 输出 `Agent` 工具调用 → `AgentTool.execute` → 解析 `subagent_type` → 工具过滤 → 创建 `PermissionChecker` → 实例化 `Agent` 子类 → `await sub_agent.run_to_completion(prompt)` → 返回结果。
-  - 异步：同上但 `is_background=True` 走 `TaskManager.launch` 启动 `asyncio.Task`，立即返回任务 ID；任务完成时把 ID 写进 `_notify_queue`，主 Agent 在 `_check_completed_tasks` 通过 `poll_completed` 抽出来再用 `inject_task_notifications` 把 `<task-notification>` 注入下一轮 user message。
-  - Fork：扫父对话 `FORK_BOILERPLATE_TAG` 拒绝嵌套 → `copy.deepcopy(history)` 复制父对话（保 byte-exact）→ 给悬挂 `tool_use` 补 `"interrupted"` placeholder `ToolResultBlock` → 追加 `FORK_BOILERPLATE + "\n\n你的任务：\n" + task` → 工具池四层过滤 → 始终后台 → 完成走通知。
-  - 团队成员：校验 team 存在 → 同 team 内自动 rename `<base>-<n>` → 解析 spec → 创建 worktree → 检测 backend → 用 `build_teammate_tools` 装配（含 `TaskCreate/TaskGet/TaskList/TaskUpdate/SendMessage` 五件套）→ in-process 走 `task_manager.launch` / pane 走 `spawn_tmux_teammate` 或 `spawn_iterm2_teammate`。
-- 调用链（模块层级）：
-  - `mewcode.app:737-747` 装配 `AgentTool` 并注册进 `registry`；`app:725-728` 实例化 `AgentLoader` 并加载所有 agents；`app:788` 把 catalog 喂给主 Agent。
-  - `app:1275-1279` 在主循环里调 `task_manager.poll_completed` + `inject_task_notifications`，把后台完成的子 Agent 结果灌进对话。
-  - `app:1029-1031` 在中断路径调 `task_manager.adopt_running` 把当前正在跑的对话挂为后台任务。
-  - `app:790 / 794` 注册 `tasks` / `trace` 两个 slash 命令以便用户主动查看后台任务和追踪树。
-- 与其他模块的交互：
-  - 依赖 `mewcode.agent`（创建子 Agent）、`mewcode.conversation`（forked 对话）、`mewcode.tools`（注册中心 + 过滤）、`mewcode.client`（model 路由）、`mewcode.permissions`（独立 Checker）、`mewcode.worktree`（隔离）、`mewcode.teams`（团队成员）。
-  - 被 `mewcode.app` 和 `mewcode.cli` 调用。
+加载优先级固定为：
+
+```text
+<project>/.mewcode/agents
+  > ~/.mewcode/agents
+  > packaged builtins
+  > plugin agents directories
+```
+
+项目和用户插件目录中的 `<plugin>/agents/*.md` 自动发现，也可以调用
+`register_plugin_source()` 显式注册。文件级解析失败只记录 warning；`get(name)` 热重载失败时
+回退最近一次有效定义。未知 frontmatter 字段保存在 `metadata`，供后续扩展使用。
+
+### 统一 Agent 工具
+
+```text
+Agent(
+  prompt: str,
+  description: str,
+  subagent_type?: str,
+  model?: str,
+  run_in_background?: bool,
+  name?: str,
+  isolation?: str,
+  team_name?: str,
+)
+```
+
+- `subagent_type` 非空：加载对应定义，创建空白对话的专家 Agent。
+- `subagent_type` 为空：构造 Fork，继承父完整消息，强制后台。
+- 未知类型返回带可用类型列表的错误 `ToolResult`。
+- `team_name` 和 `isolation=worktree` 作为稳定 Schema 预留，分别由 CH15、CH14 落地。
+
+## 4. 功能需求
+
+### F1：定义和加载
+
+- `AgentDefinition`/`AgentDef` 保存角色、描述、prompt、工具白黑名单、模型、轮次、权限、后台、
+  isolation、来源和原始 metadata。
+- 校验 name、description、body、model、permissionMode、isolation、maxTurns 和列表字段。
+- 内置 `Explore`、`Plan`、`general-purpose`；`Verification` 仅在 flag 开启时出现。
+
+### F2：Fork 与 RunToCompletion
+
+- Fork 用 `copy.deepcopy` 保留 text、thinking、tool_use、tool_result 的完整结构。
+- 父历史末尾存在悬挂 tool_use 时补 `interrupted` 错误结果。
+- Fork 指令包含 `<fork_boilerplate>`；历史中已存在该标签时拒绝再次 Fork。
+- `RunToCompletion` 不等待用户输入，以模型最后一个无工具调用回合的文本作为结果。
+
+### F3：隔离和共享
+
+- 隔离：ConversationManager、PermissionChecker、FileCache、replacement state、Token 和轮次状态。
+- 共享：Provider client、HookEngine、文件系统和父工具实现中的外部连接基础设施。
+- Fork 额外继承父 system prompt、完整历史、active skills 和 replacement decisions 的独立副本。
+
+### F4：工具过滤
+
+过滤顺序：
+
+1. MCP 工具直通。
+2. 全局禁用 Agent、AskUserQuestion 等递归/交互工具。
+3. project/user/plugin 自定义定义叠加管理类工具限制。
+4. 后台 Agent 叠加 `ASYNC_AGENT_ALLOWED_TOOLS`。
+5. 定义级 `disallowedTools` 和 `tools`。
+
+模型可见 Schema 与实际 Registry 使用同一个过滤结果。核心文件工具重新实例化，避免共享父文件缓存。
+
+### F5：后台任务
+
+- `TaskManager` 状态：running / completed / failed / cancelled。
+- 显式 `run_in_background`、定义 `background: true`、Fork 三种路径直接后台启动。
+- 前台执行超过 120 秒时原实例自动转后台，不取消重跑。
+- 用户按 ESC 可把正在执行的前台子 Agent 原实例移交后台。
+- 后台默认 600 秒超时；`cancel` 同时清理 monitor 和实际执行 task。
+- 完成 ID 进入 `asyncio.Queue`，TUI 只在父 Agent 空闲时注入通知，不修改正在发送的请求。
+
+### F6：链路追踪
+
+- `TraceRegistry` 记录 `agent_id / parent_id / trace_id`、状态、起止时间、Task ID 和 Token。
+- 支持按 trace 查询节点和汇总输入/输出 Token。
+- 同步完成、后台完成、失败、超时和取消都关闭 TraceNode。
+
+### F7：Slash Command
+
+- `/tasks`：列出后台任务。
+- `/task info <id>`：查看状态、耗时、Token、Trace 和结果。
+- `/task cancel <id>`：取消运行任务。
+- `/trace [trace-id]`：查看调用树和 Token 汇总。
+
+## 5. 非功能需求
+
+- 子 Agent 不可使用 `Agent`，Fork-of-Fork 必须确定性拒绝。
+- 非交互权限决策中的 ask 转为 deny，不创建无人消费的 UI future。
+- 后台完成通知 result 最多 5000 字符。
+- TaskManager 只在同一 asyncio event loop 访问内部状态。
+- App 退出时取消并等待仍在运行的后台任务。
+- 单个 Agent 定义、子任务或通知失败不得导致 TUI 进程退出。
 
 ## 6. Out of Scope
 
-- 子 Agent 输出全在内存事件流里，不落盘 task 输出文件。
-- 不实现 RemoteAgent / DreamTask / LocalWorkflow / MonitorMcp 这些 TaskType。
-- 不实现 fork 路径下的 worktree notice 注入（仅 `_execute_with_worktree` 支持）。
-- 不接入 plugin / flag / managed 加载源（`register_plugin_source` 仅保留接口，未实装）。
-- 不消费 `skills` / `hooks` / `mcpServers` / `memory` / `omitMewcodeMd` 等字段——仅在解析层保留，运行时落地留给后续章节。
-- 不实现 `PermissionMode.PLAN` 的复杂裁剪与 bubble。
-- 不实现 120s 自动超时切后台 / 持久化后台恢复。
-- 不实现 `isolation: remote` 远端运行后端。
-- 不内置 Statusline-Setup / Code-Guide 等非核心 Agent。
+- Git worktree 创建、合并和清理：CH14。
+- 长期 Team、Mailbox、共享任务和外部 pane backend：CH15。
+- 后台任务跨进程持久化与恢复。
+- 远程 Agent backend、Agent 市场和版本管理。
 
 ## 7. 完成定义
 
-见 [checklist.md](checklist.md)，所有条目勾上即完成。
+- `tasks.md` 全部任务完成。
+- `checklist.md` 所有实现、接入、测试和边界条目关闭。
+- `pytest`、Ruff、Mypy、compileall、wheel/sdist 构建通过。

@@ -41,7 +41,13 @@ class WritePlanTool(Tool):
         temporary = self.plan_path.with_suffix(self.plan_path.suffix + ".tmp")
         temporary.write_text(params.content, encoding="utf-8")
         temporary.replace(self.plan_path)
-        return ToolResult(f"Plan saved to {self.plan_path} ({len(params.content)} characters).")
+        output = f"Plan saved to {self.plan_path} ({len(params.content)} characters)."
+        return ToolResult(
+            output,
+            data={"path": str(self.plan_path), "characters": len(params.content)},
+            preview=output,
+            artifact_path=str(self.plan_path),
+        )
 
 
 __all__ = ["WritePlanParams", "WritePlanTool"]

@@ -2,6 +2,14 @@
 
 > 任务粒度: 每个任务可在一次会话内完成，可独立交付。每条任务记录实际落地的文件与行号。
 
+## T0: 本地 Token 估算
+
+- 影响文件: `mewcode/context/manager.py`、`mewcode/context/__init__.py`
+- 依赖任务: 无
+- 完成标准: `estimate_text_tokens / estimate_message_tokens / estimate_conversation_tokens`
+  实现并导出；ASCII 约 4 chars/token、非 ASCII 约 1 char/token，统计 thinking、tool
+  input JSON 和 tool result；不依赖网络或 Provider tokenizer。
+
 ## T1: 常量、tag 与 session 助手
 
 - 影响文件: `mewcode/context/manager.py:14-30, 132-145`
@@ -12,7 +20,7 @@
 
 - 影响文件: `mewcode/context/manager.py:37-58`
 - 依赖任务: T1
-- 完成标准: `CompactEvent(before_tokens)` 在 `manager.py:37-38` 定义。`ContentReplacementState` 含 `seen_ids: set[str]` + `replacements: dict[str, str]` 两个 field（都用 `default_factory`），`manager.py:46-49` 定义。`ContentReplacementRecord` 含 `tool_use_id` / `replacement` / `kind="tool-result"`，`manager.py:52-56` 定义。
+- 完成标准: `CompactEvent(before_tokens, after_tokens)` 定义并用于自动/手动通知。`ContentReplacementState` 含 `seen_ids: set[str]` + `replacements: dict[str, str]` 两个 field（都用 `default_factory`）。`ContentReplacementRecord` 含 `tool_use_id` / `replacement` / `kind="tool-result"`。
 
 ## T3: `create_replacement_state` / `clone_replacement_state`
 
@@ -81,7 +89,7 @@
 
 - 影响文件: `mewcode/context/manager.py:439-end`
 - 依赖任务: T9, T10, T11
-- 完成标准: 自动模式 `conversation.last_input_tokens < threshold` 返回 `None`；`breaker.is_open()` 返回错误字符串；构造临时 `ConversationManager`（header SUMMARY_PROMPT + 原 history + 结尾再次提醒不要调工具）通过 `client.stream(summary_conv, system=SUMMARY_PROMPT)` 收 `TextDelta` 拼成文本；PTL 重试用 `_group_messages_by_turn` 丢最旧 1/5，最多 3 次；成功调 `conversation.replace_history(build_compact_messages(summary))` + `cleanup_tool_results(session_dir)` + `breaker.record_success()`，返回 `CompactEvent(before_tokens)`；失败 `breaker.record_failure()` 返回错误字符串。
+- 完成标准: 自动模式使用 `max(last_input_tokens, estimate_conversation_tokens(...))` 做阈值判断；`breaker.is_open()` 返回错误字符串；构造临时 `ConversationManager`（header SUMMARY_PROMPT + 原 history + 结尾再次提醒不要调工具）通过 `client.stream(summary_conv, system=SUMMARY_PROMPT)` 收 `TextDelta` 拼成文本；PTL 重试用 `_group_messages_by_turn` 丢最旧 1/5，最多 3 次；成功调 `conversation.replace_history(build_compact_messages(summary))` + 重新估算 after tokens + `cleanup_tool_results(session_dir)` + `breaker.record_success()`，返回 `CompactEvent(before_tokens, after_tokens)`；失败 `breaker.record_failure()` 返回错误字符串。
 
 ## T13: Anthropic 客户端缓存断点
 
@@ -100,9 +108,10 @@
 - 完成标准:
   - import 段加 `ContentReplacementRecord / ContentReplacementState / append_replacement_records / create_replacement_state / load_replacement_records / reconstruct_replacement_state`。
   - `Agent.__init__` 加 `self.replacement_state: ContentReplacementState = create_replacement_state()`（line 316）。
-  - 主循环（line 436 附近）：先 `await auto_compact(...)` 处理事件；中间写各种 reminder；在 `client.stream` 调用前一刻：`api_conv, _new_records = apply_tool_result_budget(conversation, self.session_dir, self.replacement_state)` → 非空 `append_replacement_records(self.session_dir, _new_records)` → `self.client.stream(api_conv, ...)`。
+  - 主循环：每轮先 `apply_tool_result_budget`，把 new records 写入 transcript，并把返回 history/flags/token 显式提交回原 conversation；再刷新 Token 估算并 `await auto_compact(...)`；中间写 reminder；最后把同一个外层 conversation 传给 `client.stream`。
+  - Provider stream 完成后把 `response.input_tokens` 回写 `conversation.last_input_tokens`；假客户端未提供 usage 时回退本地估算。
   - `manual_compact` 直接走 `auto_compact(..., manual=True)`，不再前置调 `apply_tool_result_budget`（compact 将整段替换 history，前置 apply 的产物会被丢弃）。
-  - 另一主循环变体（line 960）：同样把 `apply_tool_result_budget` 移到 `client.stream` 前一刻。
+  - `CompactNotification` 与 `/compact` 文案显示 `before_tokens -> after_tokens`。
 
 ## T15: Fork 状态继承
 
@@ -113,3 +122,6 @@
 ## T16: 测试
 
 - 影响文件: `tests/test_context.py`、`tests/test_replacement_state.py`
+- 完成标准: 除既有 Layer 1/2、恢复与缓存测试外，新增 Token 中英文估算、估算触发自动
+  compact、compact 后 Token 重置、Agent Loop 大结果回写外层历史、`/compact` 前后 Token
+  文案测试；全量回归通过。

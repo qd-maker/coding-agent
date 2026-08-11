@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
@@ -67,6 +68,15 @@ class ToolRegistry:
     def set_plan_mode(self, enabled: bool) -> None:
         """Restrict model-visible schemas without changing explicit enable state."""
         self._plan_mode = enabled
+
+    def set_work_dir(self, work_dir: str | Path) -> None:
+        """Retarget work-directory-aware tools after a worktree transition."""
+
+        resolved = Path(work_dir).resolve()
+        for tool in self._tools.values():
+            setter = getattr(tool, "set_work_dir", None)
+            if callable(setter):
+                setter(resolved)
 
     def _is_schema_visible(self, tool: Tool) -> bool:
         if not self.is_enabled(tool.name):
@@ -215,6 +225,11 @@ class ToolRegistry:
         return ToolResult(
             f"{output}{marker}",
             result.is_error,
+            data=result.data,
+            preview=result.preview,
+            artifact_path=result.artifact_path,
+            exit_code=result.exit_code,
+            diagnostics=result.diagnostics,
         )
 
     def _require_name(self, name: str) -> None:
@@ -222,7 +237,10 @@ class ToolRegistry:
             raise KeyError(f"Unknown tool: {name}")
 
 
-def create_default_registry(file_cache: Any | None = None) -> ToolRegistry:
+def create_default_registry(
+    file_cache: Any | None = None,
+    work_dir: str | Path | None = None,
+) -> ToolRegistry:
     from mewcode.tools.bash import Bash
     from mewcode.tools.edit_file import EditFile
     from mewcode.tools.glob import Glob
@@ -231,12 +249,12 @@ def create_default_registry(file_cache: Any | None = None) -> ToolRegistry:
     from mewcode.tools.write_file import WriteFile
 
     registry = ToolRegistry()
-    registry.register(ReadFile(file_cache=file_cache))
-    registry.register(WriteFile(file_cache=file_cache))
-    registry.register(EditFile(file_cache=file_cache))
-    registry.register(Bash())
-    registry.register(Glob())
-    registry.register(Grep())
+    registry.register(ReadFile(file_cache=file_cache, work_dir=work_dir))
+    registry.register(WriteFile(file_cache=file_cache, work_dir=work_dir))
+    registry.register(EditFile(file_cache=file_cache, work_dir=work_dir))
+    registry.register(Bash(work_dir=work_dir))
+    registry.register(Glob(work_dir=work_dir))
+    registry.register(Grep(work_dir=work_dir))
     return registry
 
 

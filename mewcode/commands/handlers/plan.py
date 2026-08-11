@@ -2,16 +2,25 @@
 
 from __future__ import annotations
 
-from typing import Protocol
+from mewcode.commands.registry import Command, CommandContext, CommandType
 
 
-class PlanModeTarget(Protocol):
-    def set_plan_mode(self, enabled: bool) -> None: ...
+async def handle_plan(ctx: CommandContext) -> None:
+    ctx.ui.set_plan_mode(True)
+    await ctx.ui.add_system_message("Plan on (shift+tab to cycle)")
+    ctx.ui.refresh_status()
+    if ctx.args:
+        await ctx.ui.send_user_message(ctx.args)
 
 
-def handle_plan(target: PlanModeTarget) -> str:
-    target.set_plan_mode(True)
-    return "Plan on (shift+tab to cycle)"
+PLAN_COMMAND = Command(
+    name="plan",
+    aliases=("p",),
+    description="进入只读计划模式",
+    usage="/plan [任务描述]",
+    arg_prompt="可选任务描述",
+    type=CommandType.LOCAL_UI,
+    handler=handle_plan,
+)
 
-
-__all__ = ["handle_plan"]
+__all__ = ["PLAN_COMMAND", "handle_plan"]

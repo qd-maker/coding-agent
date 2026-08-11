@@ -8,6 +8,7 @@ from typing import ClassVar
 
 from pydantic import BaseModel, Field
 
+from mewcode.tools._file_support import resolve_tool_path
 from mewcode.tools.base import SKIP_DIRS, Tool, ToolResult
 
 
@@ -27,8 +28,14 @@ class Glob(Tool):
     category = "read"
     is_concurrency_safe = True
 
+    def __init__(self, work_dir: str | Path | None = None) -> None:
+        self.work_dir = Path(work_dir).resolve() if work_dir is not None else None
+
+    def set_work_dir(self, work_dir: str | Path) -> None:
+        self.work_dir = Path(work_dir).resolve()
+
     async def execute(self, params: Params) -> ToolResult:
-        base = Path(params.path).expanduser()
+        base = resolve_tool_path(self.work_dir, params.path)
         if not base.exists():
             return ToolResult(f"Error: path not found: {base}", is_error=True)
         if not base.is_dir():
@@ -36,9 +43,7 @@ class Glob(Tool):
         try:
             candidates = list(base.glob(params.pattern))
             normalized_pattern = params.pattern.replace("\\", "/")
-            is_exact_basename = "/" not in normalized_pattern and not has_magic(
-                normalized_pattern
-            )
+            is_exact_basename = "/" not in normalized_pattern and not has_magic(normalized_pattern)
             if not candidates and is_exact_basename:
                 candidates = list(base.rglob(params.pattern))
             matches = []

@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
+import json
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +14,7 @@ from typing import Any, Literal, cast
 import yaml
 
 Effect = Literal["allow", "deny"]
+MatchMode = Literal["glob", "exact"]
 _RULE_RE = re.compile(r"^(\w+)\((.+)\)$")
 _CONTENT_FIELDS = {
     "Bash": "command",
@@ -22,11 +26,50 @@ _CONTENT_FIELDS = {
 }
 
 
+def normalize_permission_content(tool_name: str, content: str) -> str:
+    """Create a stable approval signature without broadening its scope."""
+
+    value = content.strip()
+    if tool_name == "Bash":
+        return " ".join(value.split())
+    if tool_name in {"ReadFile", "WriteFile", "EditFile"} and value:
+        return os.path.normcase(os.path.normpath(value))
+    return value
+
+
+def normalize_permission_arguments(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Normalize only permission-relevant fields while preserving the full request shape."""
+
+    normalized = dict(arguments)
+    field = _CONTENT_FIELDS.get(tool_name)
+    if field is not None and field in normalized:
+        normalized[field] = normalize_permission_content(tool_name, str(normalized[field]))
+    return normalized
+
+
+def permission_argument_hash(tool_name: str, arguments: dict[str, Any]) -> str:
+    payload = {
+        "tool": tool_name,
+        "arguments": normalize_permission_arguments(tool_name, arguments),
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()[:12]
+
+
 @dataclass(frozen=True, slots=True)
 class Rule:
     tool_name: str
     pattern: str
     effect: Effect = "allow"
+    match_mode: MatchMode = "glob"
+    argument_hash: str | None = None
 
     @property
     def tool(self) -> str:
@@ -38,20 +81,55 @@ class Rule:
     def decision(self) -> str:
         return self.effect
 
-    def matches(self, tool_name: str, content: str) -> bool:
-        return self.tool_name == tool_name and fnmatch.fnmatch(content, self.pattern)
+    def matches(
+        self,
+        tool_name: str,
+        content: str,
+        arguments: dict[str, Any] | None = None,
+    ) -> bool:
+        normalized_content = normalize_permission_content(tool_name, content)
+        normalized_pattern = normalize_permission_content(tool_name, self.pattern)
+        if self.tool_name != tool_name:
+            return False
+        if self.argument_hash is not None:
+            if (
+                arguments is None
+                or permission_argument_hash(tool_name, arguments) != self.argument_hash
+            ):
+                return False
+        if self.match_mode == "exact":
+            return normalized_content == normalized_pattern
+        return fnmatch.fnmatch(normalized_content, normalized_pattern)
 
     def as_yaml(self) -> dict[str, str]:
-        return {"rule": f"{self.tool_name}({self.pattern})", "effect": self.effect}
+        payload = {"rule": f"{self.tool_name}({self.pattern})", "effect": self.effect}
+        if self.match_mode == "exact":
+            payload["match"] = "exact"
+        if self.argument_hash is not None:
+            payload["arguments_hash"] = self.argument_hash
+        return payload
 
 
-def parse_rule(raw: str, effect: str) -> Rule:
+def parse_rule(
+    raw: str,
+    effect: str,
+    match_mode: str = "glob",
+    argument_hash: str | None = None,
+) -> Rule:
     if effect not in {"allow", "deny"}:
         raise ValueError(f"Invalid rule effect: {effect}")
+    if match_mode not in {"glob", "exact"}:
+        raise ValueError(f"Invalid permission match mode: {match_mode}")
     match = _RULE_RE.fullmatch(raw.strip())
     if match is None:
         raise ValueError(f"Invalid permission rule: {raw}")
-    return Rule(match.group(1), match.group(2), cast(Effect, effect))
+    return Rule(
+        match.group(1),
+        match.group(2),
+        cast(Effect, effect),
+        cast(MatchMode, match_mode),
+        argument_hash,
+    )
 
 
 def extract_content(tool_name: str, arguments: dict[str, Any]) -> str:
@@ -78,7 +156,13 @@ def _load_rules_file(path: Path | None) -> list[Rule]:
             effect = item["effect"]
             if not isinstance(rule_text, str) or not isinstance(effect, str):
                 continue
-            rules.append(parse_rule(rule_text, effect))
+            match_mode = item.get("match", "glob")
+            if not isinstance(match_mode, str):
+                continue
+            argument_hash = item.get("arguments_hash")
+            if argument_hash is not None and not isinstance(argument_hash, str):
+                continue
+            rules.append(parse_rule(rule_text, effect, match_mode, argument_hash))
         except (KeyError, ValueError, TypeError):
             continue
     return rules
@@ -113,15 +197,20 @@ class RuleEngine:
     def rules(self) -> list[Rule]:
         return [rule for tier in self._load_tiers() for rule in tier]
 
-    def evaluate(self, tool_name: str, content: str) -> Effect | None:
+    def evaluate(
+        self,
+        tool_name: str,
+        content: str,
+        arguments: dict[str, Any] | None = None,
+    ) -> Effect | None:
         for rules in reversed(self._load_tiers()):
             for rule in reversed(rules):
-                if rule.matches(tool_name, content):
+                if rule.matches(tool_name, content, arguments):
                     return rule.effect
         return None
 
     def allows(self, tool_name: str, arguments: dict[str, Any]) -> bool:
-        return self.evaluate(tool_name, extract_content(tool_name, arguments)) == "allow"
+        return self.evaluate(tool_name, extract_content(tool_name, arguments), arguments) == "allow"
 
     def append_local_rule(self, rule: Rule) -> None:
         if self.local_rules_path is None:
@@ -140,9 +229,19 @@ class RuleEngine:
             encoding="utf-8",
         )
 
+    def clear_local_rules(self) -> None:
+        """Remove only the highest-priority local rule tier."""
+
+        self._memory_local_rules.clear()
+        if self.local_rules_path is None:
+            return
+        self.local_rules_path.parent.mkdir(parents=True, exist_ok=True)
+        self.local_rules_path.write_text("[]\n", encoding="utf-8")
+
 
 __all__ = [
     "Effect",
+    "MatchMode",
     "Rule",
     "RuleEngine",
     "_CONTENT_FIELDS",
@@ -150,4 +249,7 @@ __all__ = [
     "_load_rules_file",
     "extract_content",
     "parse_rule",
+    "normalize_permission_content",
+    "normalize_permission_arguments",
+    "permission_argument_hash",
 ]

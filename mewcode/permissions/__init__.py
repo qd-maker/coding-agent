@@ -7,7 +7,16 @@ from enum import StrEnum
 from mewcode.permissions.checker import Decision, PermissionChecker
 from mewcode.permissions.dangerous import DangerousCommandDetector, is_safe_command
 from mewcode.permissions.modes import DecisionEffect, PermissionMode, mode_decide
-from mewcode.permissions.rules import Rule, RuleEngine, extract_content, parse_rule
+from mewcode.permissions.rules import (
+    MatchMode,
+    Rule,
+    RuleEngine,
+    extract_content,
+    normalize_permission_arguments,
+    normalize_permission_content,
+    parse_rule,
+    permission_argument_hash,
+)
 from mewcode.permissions.sandbox import PathSandbox
 
 
@@ -24,6 +33,7 @@ __all__ = [
     "Decision",
     "DecisionEffect",
     "PathSandbox",
+    "MatchMode",
     "PermissionChecker",
     "PermissionDecision",
     "PermissionMode",
@@ -32,5 +42,8 @@ __all__ = [
     "extract_content",
     "is_safe_command",
     "mode_decide",
+    "normalize_permission_content",
+    "normalize_permission_arguments",
+    "permission_argument_hash",
     "parse_rule",
 ]

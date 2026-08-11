@@ -24,6 +24,38 @@ from mewcode.tools.base import (
     ToolCallStart,
 )
 
+_EPHEMERAL: dict[str, str] = {"type": "ephemeral"}
+
+
+def _mark_last_user_tail_for_cache(messages: list[dict[str, Any]]) -> None:
+    """Attach cache_control to the last block of the final user message (in-place)."""
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            message["content"] = [
+                {"type": "text", "text": content, "cache_control": dict(_EPHEMERAL)}
+            ]
+            return
+        if isinstance(content, list) and content:
+            last = content[-1]
+            if isinstance(last, dict):
+                last["cache_control"] = dict(_EPHEMERAL)
+            return
+        return
+
+
+def _mark_last_tool_for_cache(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Shallow-copy tools and mark the last schema for prompt caching."""
+    if not tools:
+        return tools
+    copied = list(tools)
+    last = dict(copied[-1])
+    last["cache_control"] = dict(_EPHEMERAL)
+    copied[-1] = last
+    return copied
+
 
 class LLMError(Exception):
     """Base class for all provider-independent LLM failures."""
@@ -120,18 +152,20 @@ class AnthropicClient(LLMClient):
         system: str | None = None,
         tools: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[StreamEvent]:
+        messages = conversation.serialize("anthropic")
+        _mark_last_user_tail_for_cache(messages)
         kwargs: dict[str, Any] = {
             "model": self.config.model,
             "max_tokens": self.max_output_tokens,
-            "messages": conversation.serialize("anthropic"),
+            "messages": messages,
         }
         if system:
-            kwargs["system"] = system
+            kwargs["system"] = [{"type": "text", "text": system, "cache_control": dict(_EPHEMERAL)}]
         if tools:
-            kwargs["tools"] = tools
+            kwargs["tools"] = _mark_last_tool_for_cache(tools)
         if self.config.thinking:
             if _supports_adaptive_thinking(self.config.model):
-                kwargs["thinking"] = {"type": "enabled", "budget_tokens": 0}
+                kwargs["thinking"] = {"type": "adaptive"}
             else:
                 kwargs["thinking"] = {
                     "type": "enabled",

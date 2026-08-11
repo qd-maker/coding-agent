@@ -1,9 +1,78 @@
-provider:
-  name: default
-  protocol: anthropic
-  model: claude-sonnet-4-6
-  base_url: https://api.anthropic.com
-  api_key: ${ANTHROPIC_API_KEY}
-  thinking: true
+providers:
+  - name: anthropic-official
+    protocol: anthropic
+    base_url: https://api.anthropic.com
+    api_key: ${ANTHROPIC_API_KEY}
+    model: claude-sonnet-4-6
+    thinking: true
+
+  # --- OpenAI-compatible example (the first provider is active) ---
+  # - name: openai-official
+  #   protocol: openai
+  #   base_url: https://api.openai.com/v1
+  #   api_key: ${OPENAI_API_KEY}
+  #   model: gpt-5.5
+  #   thinking: false
 
 system_prompt: You are MewCode, a concise and helpful coding assistant.
+
+# Git Worktree isolation (optional)
+worktree:
+  enabled: true
+  # Large checkout-local dependency directories can be linked from the main checkout.
+  symlink_directories: [] # e.g. [node_modules, .venv]
+  stale_cleanup_interval: 3600
+  stale_cutoff_hours: 24
+
+# Agent Team（CH15）
+# auto/空值：交互式环境按 tmux → iTerm2 检测；非交互环境使用 in-process。
+teammate_mode: in-process
+# 纯调度采用双锁：这里为 true 且 MEWCODE_COORDINATOR_MODE=1 才会生效。
+enable_coordinator_mode: false
+
+# MCP Servers (optional)
+# Each item declares its name (ASCII letters/digits/underscores only).
+# Specify either 'command' (stdio) or 'url' (HTTP), not both.
+mcp_servers:
+  # --- stdio example: Context7 library documentation ---
+  - name: context7
+    command: npx
+    args: ["-y", "@upstash/context7-mcp"]
+    startup_timeout: 20 # connect + list_tools, seconds
+    tool_timeout: 120 # each tool call, seconds
+    # Optional per-server env vars (${VAR} placeholders are expanded)
+    # env:
+    #   SOME_VAR: value
+
+  # --- HTTP example: remote MCP server with Authorization header ---
+  # - name: remote_tools
+  #   url: https://mcp.example.com/mcp
+  #   headers:
+  #     Authorization: Bearer ${REMOTE_MCP_TOKEN}
+  #     X-Client-Id: mewcode
+
+# Lifecycle Hooks (optional)
+# hooks:
+#   - id: inject-architecture
+#     event: session_start
+#     once: true
+#     action:
+#       type: prompt
+#       message: "开始前先阅读项目的 ARCHITECTURE.md。"
+#
+#   - id: block-dangerous-delete
+#     event: pre_tool_use
+#     condition: 'tool == "Bash" && args.command =~ /rm\s+-rf/'
+#     reject: true
+#     action:
+#       type: prompt
+#       message: "拒绝危险删除命令：$TOOL_ARGS.command"
+#
+#   - id: format-python
+#     event: file_change
+#     condition: 'args.file_path ~= "*.py"'
+#     async: true
+#     action:
+#       type: command
+#       command: "ruff format $FILE_PATH"
+#       timeout: 20

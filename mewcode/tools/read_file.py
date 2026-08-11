@@ -7,7 +7,7 @@ from typing import Any, ClassVar
 
 from pydantic import BaseModel, Field
 
-from mewcode.tools._file_support import cache_get, cache_set
+from mewcode.tools._file_support import cache_get, cache_set, resolve_tool_path
 from mewcode.tools.base import Tool, ToolResult
 
 
@@ -24,11 +24,19 @@ class ReadFile(Tool):
     category = "read"
     is_concurrency_safe = True
 
-    def __init__(self, file_cache: Any | None = None) -> None:
+    def __init__(
+        self,
+        file_cache: Any | None = None,
+        work_dir: str | Path | None = None,
+    ) -> None:
         self.file_cache = file_cache
+        self.work_dir = Path(work_dir).resolve() if work_dir is not None else None
+
+    def set_work_dir(self, work_dir: str | Path) -> None:
+        self.work_dir = Path(work_dir).resolve()
 
     async def execute(self, params: Params) -> ToolResult:
-        path = Path(params.file_path).expanduser()
+        path = resolve_tool_path(self.work_dir, params.file_path)
         if not path.exists():
             return ToolResult(f"Error: file not found: {path}", is_error=True)
         if not path.is_file():

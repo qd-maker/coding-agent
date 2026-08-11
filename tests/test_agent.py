@@ -230,7 +230,12 @@ def test_context_injections_are_idempotent() -> None:
     assert conversation.inject_environment("duplicate") is False
     assert conversation.inject_long_term_memory("rules", ["memory"]) is True
     assert conversation.inject_long_term_memory("duplicate", []) is False
-    assert [message.content for message in conversation.history] == ["env", "rules\n\nmemory"]
+    assert [message.content for message in conversation.history] == [
+        "env",
+        "## 项目指令\nrules",
+        "## 自动记忆\nmemory",
+        "好的，我已了解项目背景和记忆。",
+    ]
 
 
 def test_history_copy_and_replace() -> None:
@@ -414,9 +419,7 @@ async def test_react_finds_nested_named_file_then_deletes_and_verifies(tmp_path:
     plan_dir.mkdir()
     target = plan_dir / "quiet-delta-0715-2356.md"
     target.write_text("# disposable plan", encoding="utf-8")
-    delete_command = (
-        f'"{sys.executable}" -c "import os,sys;os.remove(sys.argv[1])" "{target}"'
-    )
+    delete_command = f'"{sys.executable}" -c "import os,sys;os.remove(sys.argv[1])" "{target}"'
     client = MockLLMClient(
         [
             [
@@ -451,8 +454,7 @@ async def test_react_finds_nested_named_file_then_deletes_and_verifies(tmp_path:
     assert not target.exists()
     assert len(client.snapshots) == 3
     assert any(
-        isinstance(event, StreamText) and event.text == "Deleted and verified."
-        for event in events
+        isinstance(event, StreamText) and event.text == "Deleted and verified." for event in events
     )
 
 
@@ -747,7 +749,7 @@ async def test_do_mode_supersedes_persisted_plan_reminders(tmp_path: Path) -> No
     agent = Agent(client, registry=registry, work_dir=tmp_path)
     conversation = ConversationManager()
     conversation.add_system_reminder("Plan Mode remains active. Stay read-only.")
-    conversation.add_user_message("implement it")
+    conversation.add_user_message("continue")
 
     agent.set_permission_mode(PermissionMode.PLAN)
     agent.set_permission_mode(PermissionMode.DEFAULT)
@@ -938,7 +940,19 @@ async def test_large_tool_result_is_persisted(tmp_path: Path) -> None:
     agent = Agent(client, registry=registry, work_dir=tmp_path)
     events = [event async for event in agent.run("large")]
     result = next(event for event in events if isinstance(event, ToolResultEvent))
-    assert "full tool result saved to" in result.detail
+    # The event can render the full result once, while persistent history keeps only preview/path.
+    assert len(result.detail) == 9_000
     saved = agent.session_dir / "large-1.txt"
     assert saved.is_file()
     assert len(saved.read_text(encoding="utf-8")) == 9_000
+    assert "large-1" in agent.replacement_state.replacements
+    assert agent.replacement_state.replacements["large-1"].startswith("<persisted-output>")
+    stored = next(
+        tool_result
+        for message in agent.conversation.history
+        for tool_result in message.tool_results
+        if tool_result.tool_use_id == "large-1"
+    )
+    assert stored.content.startswith("<persisted-output>")
+    assert str(saved) in stored.content
+    assert len(stored.content) < 9_000

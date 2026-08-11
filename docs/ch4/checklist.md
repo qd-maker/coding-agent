@@ -62,7 +62,7 @@
 - [x] 工具执行阻塞时 `.tool.is-running` 在 120ms 内变化并显示 `Running ControlledRead` 与耗时；工具完成后 `running is False` 且稳定显示 `✓ ControlledRead`（`test_tool_line_animates_until_execution_finishes`）
 - [x] 完整 emoji 序列降级：笑脸、ZWJ 职业、国旗、keycap、BMP variation、默认彩色符号、肤色修饰和状态 emoji 输入 `🥰 👨‍💻 🇨🇳 1️⃣ ☀️ ©️ ❤️ ⏰ 👍🏽 ✅ ❌` 后得到 `:) ◇ ◇ 1 ☀ © ❤ ◇ ◇ ✓ ✗`（`test_terminal_safe_text_replaces_colored_emoji_sequences`）
 - [x] max_tokens 升档：模拟 `stop_reason="max_tokens"` 看到 `RetryEvent(reason="max_tokens escalation")` 与 `client.set_max_output_tokens(64000)`；连续 3 次后停止恢复进入下一轮主流程（`mewcode/agent.py:529-559`）
-- [ ] 留存证据：验收阶段无截图；如需补，可在 Textual 中输入 `hi` 拍照保存 stream 渲染
+- [x] 截图证据已保存到 `docs/assets/`，覆盖 TUI、Plan、YOLO 与 Accept Edits 权限流程
 
 ## 5. 文档
 

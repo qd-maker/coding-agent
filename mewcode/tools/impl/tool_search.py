@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Awaitable, Callable
 from typing import Any, ClassVar, cast
 
 from pydantic import BaseModel, Field
@@ -32,24 +33,39 @@ class ToolSearchTool(Tool):
     is_concurrency_safe = True
     should_defer = False
 
-    def __init__(self, registry: ToolRegistry, protocol: str = "anthropic") -> None:
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        protocol: str = "anthropic",
+        external_initializer: Callable[[bool], Awaitable[None]] | None = None,
+    ) -> None:
         self.registry = registry
         self.protocol = protocol
+        self.external_initializer = external_initializer
 
     def get_schema(self) -> dict[str, Any]:
         return cast(dict[str, Any], _strip_titles(super().get_schema()))
 
     async def execute(self, params: ToolSearchParams) -> ToolResult:
         query = params.query.strip()
-        if query.casefold().startswith("select:"):
-            names = [name.strip() for name in query[7:].split(",") if name.strip()]
-            schemas = self.registry.find_deferred_by_names(names, self.protocol)
-        else:
-            schemas = self.registry.search_deferred(
+        retry_failed = query.casefold().startswith("retry:")
+        if retry_failed:
+            query = query[6:].strip() or "mcp"
+
+        def search() -> list[dict[str, Any]]:
+            if query.casefold().startswith("select:"):
+                names = [name.strip() for name in query[7:].split(",") if name.strip()]
+                return self.registry.find_deferred_by_names(names, self.protocol)
+            return self.registry.search_deferred(
                 query,
                 max_results=params.max_results,
                 protocol=self.protocol,
             )
+
+        schemas = [] if retry_failed else search()
+        if not schemas and self.external_initializer is not None:
+            await self.external_initializer(retry_failed)
+            schemas = search()
         if not schemas:
             available = ", ".join(self.registry.get_deferred_tool_names()) or "none"
             return ToolResult(f'No matching deferred tools for "{query}". Available: {available}')

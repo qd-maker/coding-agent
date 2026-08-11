@@ -201,12 +201,13 @@ async def test_agent_reinjects_environment_and_memory_after_compact(tmp_path: Pa
     conversation = ConversationManager()
     for index in range(8):
         conversation.add_user_message(f"old message {index}")
-    conversation.last_input_tokens = 900
+    # Force Layer 2 auto_compact: threshold for window 50k is 17k.
+    conversation.last_input_tokens = 40_000
     client = RecordingClient()
     agent = Agent(
         client,
         work_dir=tmp_path,
-        context_window=1_000,
+        context_window=50_000,
         instructions_content="project instructions",
         memory_manager=MemoryManager(),
     )
@@ -214,5 +215,31 @@ async def test_agent_reinjects_environment_and_memory_after_compact(tmp_path: Pa
     result = await agent.run_to_completion("continue", conversation)
 
     assert result == "done"
-    assert client.snapshots[0][0].startswith("<environment>")
-    assert client.snapshots[0][1] == "project instructions\n\nremembered fact"
+    # First stream call is the summarizer; the post-compact agent turn is last.
+    assert len(client.snapshots) >= 2
+    post_compact = client.snapshots[-1]
+    assert any(content.startswith("<environment>") for content in post_compact)
+    assert "## 项目指令\nproject instructions" in post_compact
+    assert "## 自动记忆\nremembered fact" in post_compact
+    assert "好的，我已了解项目背景和记忆。" in post_compact
+    assert any(content.startswith("[摘要]") for content in post_compact)
+
+
+@pytest.mark.asyncio
+async def test_agent_auto_compacts_from_local_token_estimate(tmp_path: Path) -> None:
+    conversation = ConversationManager()
+    conversation.add_user_message("A" * 4_500)
+    assert conversation.last_input_tokens == 0
+    client = RecordingClient()
+    agent = Agent(
+        client,
+        work_dir=tmp_path,
+        context_window=34_000,  # automatic threshold is 1,000 tokens
+    )
+
+    result = await agent.run_to_completion("", conversation)
+
+    assert result == "done"
+    assert len(client.snapshots) == 2
+    assert any(content.startswith("[摘要]") for content in client.snapshots[-1])
+    assert conversation.last_input_tokens > 0

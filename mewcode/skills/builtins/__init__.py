@@ -1,0 +1,1 @@
+"""Packaged MewCode Skill definitions."""

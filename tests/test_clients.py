@@ -120,8 +120,16 @@ async def test_anthropic_stream_translates_thinking_text_and_tool_events() -> No
         ToolCallComplete("call-1", "echo", {"text": "hi"}),
         StreamEnd("end_turn", 11, 7),
     ]
-    assert messages.kwargs["thinking"] == {"type": "enabled", "budget_tokens": 0}
-    assert messages.kwargs["system"] == "system"
+    assert messages.kwargs["thinking"] == {"type": "adaptive"}
+    assert messages.kwargs["system"] == [
+        {"type": "text", "text": "system", "cache_control": {"type": "ephemeral"}}
+    ]
+    # Last user message tail is marked for Anthropic prompt cache.
+    last_user = next(
+        msg for msg in reversed(messages.kwargs["messages"]) if msg.get("role") == "user"
+    )
+    assert isinstance(last_user["content"], list)
+    assert last_user["content"][-1].get("cache_control") == {"type": "ephemeral"}
     assert conversation.last_input_tokens == 11
 
 

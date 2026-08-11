@@ -45,5 +45,13 @@ class FileCache:
     def invalidate(self, path: str | Path) -> None:
         self._entries.pop(Path(path).resolve(), None)
 
+    def clear(self) -> None:
+        """Drop every cached checkout-local entry."""
+
+        self._entries.clear()
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
 
 __all__ = ["FileCache"]

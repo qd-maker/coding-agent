@@ -42,7 +42,7 @@ class ConversationManager:
 
     history: list[Message] = field(default_factory=list)
     env_injected: bool = False
-    ltm_injected: bool = False
+    ltm_injected: bool = field(default=False, init=False)
     last_input_tokens: int = 0
 
     def add_user_message(self, content: str) -> Message:
@@ -81,13 +81,36 @@ class ConversationManager:
         self.env_injected = True
         return True
 
-    def inject_long_term_memory(self, instructions: str, memories: list[str]) -> bool:
+    def refresh_environment(self, context: str) -> None:
+        """Replace the pinned environment message or inject it when absent."""
+
+        if self.env_injected and self.history:
+            self.history[0] = Message(role="user", content=context)
+            return
+        self.inject_environment(context)
+
+    def inject_long_term_memory(
+        self,
+        instructions: str,
+        memories: str | list[str],
+    ) -> bool:
         if self.ltm_injected:
             return False
-        parts = [instructions.strip(), *[memory.strip() for memory in memories if memory.strip()]]
-        content = "\n\n".join(part for part in parts if part)
+        if isinstance(memories, str):
+            memory_content = memories.strip()
+        else:
+            memory_content = "\n\n".join(memory.strip() for memory in memories if memory.strip())
+        instructions = instructions.strip()
+        if not instructions and not memory_content:
+            return False
         insert_at = 1 if self.env_injected and self.history else 0
-        self.history.insert(insert_at, Message(role="user", content=content))
+        injected: list[Message] = []
+        if instructions:
+            injected.append(Message(role="user", content=f"## 项目指令\n{instructions}"))
+        if memory_content:
+            injected.append(Message(role="user", content=f"## 自动记忆\n{memory_content}"))
+        injected.append(Message(role="assistant", content="好的，我已了解项目背景和记忆。"))
+        self.history[insert_at:insert_at] = injected
         self.ltm_injected = True
         return True
 

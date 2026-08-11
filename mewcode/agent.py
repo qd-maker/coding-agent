@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
 import uuid
 from collections.abc import AsyncIterator, Coroutine
@@ -15,15 +16,16 @@ from typing import Any, Literal, cast
 
 from mewcode.client import LLMClient
 from mewcode.context import (
-    MAX_OUTPUT_CHARS,
-    SINGLE_RESULT_CHAR_LIMIT,
     CompactCircuitBreaker,
     CompactEvent,
+    ContentReplacementState,
+    RecoveryState,
+    append_replacement_records,
     apply_tool_result_budget,
     auto_compact,
+    create_replacement_state,
     ensure_session_dir,
-    make_persisted_preview,
-    persist_tool_result,
+    estimate_conversation_tokens,
 )
 from mewcode.conversation import (
     ConversationManager,
@@ -31,7 +33,9 @@ from mewcode.conversation import (
     ToolResultBlock,
     ToolUseBlock,
 )
+from mewcode.evidence import EvidenceBundle, RunEvidenceTracker
 from mewcode.hooks import HookContext, HookEngine
+from mewcode.memory.auto_memory import MemoryManager
 from mewcode.permissions import (
     PathSandbox,
     PermissionChecker,
@@ -39,6 +43,8 @@ from mewcode.permissions import (
     Rule,
     RuleEngine,
     extract_content,
+    normalize_permission_content,
+    permission_argument_hash,
 )
 from mewcode.prompts import (
     build_environment_context,
@@ -56,8 +62,11 @@ from mewcode.tools.base import (
     ToolCallComplete,
     ToolCallDelta,
     ToolCallStart,
+    ToolResult,
 )
 from mewcode.tools.write_plan import WritePlanTool
+
+log = logging.getLogger(__name__)
 
 MEMORY_EXTRACTION_INTERVAL = 5
 MAX_TOKENS_CEILING = 64_000
@@ -142,11 +151,23 @@ class ToolUseEvent:
     is_error: bool = False
     arguments: dict[str, Any] | None = None
     elapsed_seconds: float | None = None
+    data: dict[str, Any] | None = None
+    preview: str | None = None
+    artifact_path: str | None = None
+    exit_code: int | None = None
+    diagnostics: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class ToolResultEvent(ToolUseEvent):
     """Completed tool event; subclasses ToolUseEvent for ch03 compatibility."""
+
+
+@dataclass(frozen=True, slots=True)
+class ToolBatchEvent:
+    batch_id: str
+    tool_ids: tuple[str, ...]
+    concurrent: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +182,16 @@ class LoopComplete:
     stop_reason: str
     input_tokens: int
     output_tokens: int
+    outcome: Literal[
+        "answered", "completed", "waiting_background", "verification_failed"
+    ] = "answered"
+    evidence: EvidenceBundle | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class VerificationEvent:
+    status: Literal["started", "passed", "failed"]
+    evidence: EvidenceBundle | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,8 +209,9 @@ class ErrorEvent:
 
 @dataclass(frozen=True, slots=True)
 class CompactNotification:
-    removed_messages: int
-    summary: str
+    before_tokens: int
+    after_tokens: int
+    summary: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,6 +232,9 @@ class PermissionRequest:
     tool_name: str
     arguments: dict[str, Any]
     future: asyncio.Future[PermissionResponse]
+    reason: str = ""
+    work_dir: str = ""
+    argument_hash: str = ""
 
 
 AgentEvent = (
@@ -208,8 +243,10 @@ AgentEvent = (
     | RetryEvent
     | ToolUseEvent
     | ToolResultEvent
+    | ToolBatchEvent
     | TurnComplete
     | LoopComplete
+    | VerificationEvent
     | UsageEvent
     | ErrorEvent
     | PermissionRequest
@@ -304,6 +341,7 @@ class _ToolExecResult:
     elapsed: float
     is_error: bool = False
     is_unknown: bool = False
+    result: ToolResult | None = None
 
 
 class StreamingExecutor:
@@ -354,7 +392,7 @@ class Agent:
         permission_checker: PermissionChecker | None = None,
         context_window: int = 200_000,
         instructions_content: str = "",
-        memory_manager: Any | None = None,
+        memory_manager: MemoryManager | None = None,
         hook_engine: HookEngine | None = None,
         *,
         system: str = "",
@@ -370,6 +408,7 @@ class Agent:
         hook_prompts: list[str] | None = None,
         skill_section: str = "",
         memory_section: str = "",
+        completion_gate_enabled: bool = True,
     ) -> None:
         if registry is not None and tools is not None:
             raise ValueError("Pass registry or tools, not both")
@@ -383,12 +422,15 @@ class Agent:
         self.context_window = context_window
         self.instructions_content = instructions_content
         self.memory_manager = memory_manager
+        self.completion_gate_enabled = completion_gate_enabled
         self.hook_engine = hook_engine or HookEngine()
         self.system = system
         self.conversation = conversation or ConversationManager()
         self.agent_id = uuid.uuid4().hex[:12]
         self.session_dir = ensure_session_dir(self.work_dir)
         self.compact_breaker = CompactCircuitBreaker()
+        self.replacement_state: ContentReplacementState = create_replacement_state()
+        self.recovery_state: RecoveryState = RecoveryState()
         self.permission_checker = permission_checker or PermissionChecker(
             sandbox=PathSandbox(self.work_dir),
             rule_engine=RuleEngine(
@@ -405,16 +447,21 @@ class Agent:
         self.team_name = team_name
         self._team_manager = team_manager
         self.active_skills = dict(active_skills or {})
+        self._active_skill_allowed_tools: dict[str, tuple[str, ...]] = {}
         self._skill_catalog = skill_catalog
         self._agent_catalog = agent_catalog
         self.hook_prompts = list(hook_prompts or [])
         self.skill_section = skill_section
         self.memory_section = memory_section
         self._plan_path_cache: Path | None = None
+        self._pending_plan_execution = False
         self._mode_transition_reminder: str | None = None
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self._completed_turns = 0
+        self._loop_count = 0
+        self._extracting = False
+        self._memory_tasks: set[asyncio.Task[None]] = set()
         if team_manager is not None and team_name:
             register_task_tools(self.registry, team_manager, team_name)
         self.set_permission_mode(self.permission_mode)
@@ -458,38 +505,73 @@ class Agent:
     def _build_hook_context(self, event: str, **kwargs: Any) -> HookContext:
         arguments = cast(dict[str, Any], kwargs.get("arguments") or {})
         return HookContext(
-            event=event,
+            event_name=event,
             agent_id=self.agent_id,
-            tool_name=cast(str | None, kwargs.get("tool_name")),
-            file_path=self._infer_file_path(arguments),
-            arguments=arguments,
-            result=cast(str | None, kwargs.get("result")),
+            tool_name=cast(str, kwargs.get("tool_name") or ""),
+            file_path=cast(
+                str,
+                kwargs.get("file_path") or self._infer_file_path(arguments) or "",
+            ),
+            tool_args=arguments,
+            message=cast(str, kwargs.get("message") or ""),
+            error=cast(str, kwargs.get("error") or ""),
+            result=cast(str, kwargs.get("result") or ""),
         )
 
     def _drain_hook_events(self) -> list[HookEvent]:
         return [
-            HookEvent(name, message) for name, message in self.hook_engine.drain_notifications()
+            HookEvent(item.hook_id, item.output) for item in self.hook_engine.drain_notifications()
         ]
 
     async def _run_hook(self, event: str, **kwargs: Any) -> list[HookEvent]:
         await self.hook_engine.run_hooks(event, self._build_hook_context(event, **kwargs))
+        self.hook_prompts.extend(self.hook_engine.get_prompt_messages())
         return self._drain_hook_events()
 
+    @staticmethod
+    def _latest_message_text(conversation: ConversationManager) -> str:
+        for message in reversed(conversation.history):
+            if message.content:
+                return message.content
+        return ""
+
+    async def _error_hook_events(self, message: str) -> list[HookEvent]:
+        return await self._run_hook("error", error=message, message=message)
+
     def _consume_mailbox(self, conversation: ConversationManager) -> None:
-        if self._team_manager is None:
+        if self._team_manager is None or not self.team_name:
             return
-        messages = self._team_manager.consume_mailbox(self.agent_id)
-        if messages:
-            conversation.add_system_reminder("Team mailbox:\n" + "\n".join(messages))
+        try:
+            messages = self._team_manager.get_mailbox(self.team_name).consume(self.agent_id)
+            for message in messages:
+                if message.metadata.get("event") == "idle":
+                    member_name = str(message.metadata.get("member", ""))
+                    if member_name:
+                        self._team_manager.set_member_active(
+                            self.team_name,
+                            member_name,
+                            False,
+                        )
+                if message.message_type == "text":
+                    prefix = f"[Message from {message.from_agent}]"
+                else:
+                    prefix = f"[{message.message_type} from {message.from_agent}]"
+                conversation.add_user_message(f"{prefix} {message.content}")
+        except Exception:  # noqa: BLE001 - mailbox is auxiliary to the Agent loop
+            log.debug("failed to consume team mailbox", exc_info=True)
 
     def _memory_items(self) -> list[str]:
         if self.memory_manager is None:
             return []
+        loader = getattr(self.memory_manager, "load", None)
+        if callable(loader):
+            value = loader()
+            return [str(value)] if value else []
         getter = getattr(self.memory_manager, "get_memories", None)
-        if not callable(getter):
-            return []
-        value = getter()
-        return [str(item) for item in value] if value else []
+        if callable(getter):
+            value = getter()
+            return [str(item) for item in value] if value else []
+        return []
 
     def _inject_context(self, conversation: ConversationManager, *, force: bool = False) -> None:
         if force:
@@ -506,6 +588,59 @@ class Agent:
         memories = self._memory_items()
         if self.instructions_content or memories:
             conversation.inject_long_term_memory(self.instructions_content, memories)
+
+    def _refresh_dynamic_environment(self, conversation: ConversationManager) -> None:
+        conversation.refresh_environment(
+            build_environment_context(
+                self.work_dir,
+                active_skills=self.active_skills,
+                skill_catalog=self._skill_catalog,
+                agent_catalog=self._agent_catalog,
+            )
+        )
+
+    def _active_allowed_tool_names(self) -> set[str] | None:
+        restrictions = [set(names) for names in self._active_skill_allowed_tools.values() if names]
+        if not restrictions:
+            return None
+        allowed = restrictions[0]
+        for restriction in restrictions[1:]:
+            allowed &= restriction
+        return allowed
+
+    def _tool_allowed_by_active_skills(self, name: str) -> bool:
+        allowed = self._active_allowed_tool_names()
+        if allowed is None or name in allowed:
+            return True
+        tool = next((item for item in self.registry.list_tools() if item.name == name), None)
+        return bool(tool is not None and tool.is_system_tool)
+
+    def _skill_filtered_tool_schemas(self) -> list[dict[str, Any]]:
+        schemas = self.registry.get_all_schemas(self.protocol)
+        allowed = self._active_allowed_tool_names()
+        if allowed is None:
+            return schemas
+        system_names = {tool.name for tool in self.registry.list_tools() if tool.is_system_tool}
+        visible = allowed | system_names
+        return [schema for schema in schemas if str(schema.get("name", "")) in visible]
+
+    def _apply_context_budget(self, conversation: ConversationManager) -> None:
+        """Apply Layer 1 and commit its immutable result to the outer conversation."""
+        budgeted, new_records = apply_tool_result_budget(
+            conversation,
+            self.session_dir,
+            self.replacement_state,
+        )
+        if new_records:
+            append_replacement_records(self.session_dir, new_records)
+
+        conversation.history = budgeted.get_messages()
+        conversation.env_injected = budgeted.env_injected
+        conversation.ltm_injected = budgeted.ltm_injected
+        conversation.last_input_tokens = max(
+            budgeted.last_input_tokens,
+            estimate_conversation_tokens(budgeted),
+        )
 
     def _system_prompt(self) -> str:
         custom_instructions = "\n".join(
@@ -536,15 +671,42 @@ class Agent:
             thinking_blocks=response.thinking_blocks,
         )
 
-    async def _maybe_extract_memory(self, conversation: ConversationManager) -> None:
+    async def _extract_memories(self, conversation: ConversationManager) -> None:
+        if self._extracting:
+            return
         if self.memory_manager is None:
             return
         extractor = getattr(self.memory_manager, "extract", None)
         if not callable(extractor):
             return
-        value = extractor(conversation.get_messages())
-        if asyncio.iscoroutine(value):
-            await value
+        self._extracting = True
+        try:
+            value = extractor(self.client, conversation, self.protocol)
+            if asyncio.iscoroutine(value):
+                await value
+        except Exception:  # noqa: BLE001 - automatic memory is best-effort
+            log.debug("automatic memory extraction failed", exc_info=True)
+        finally:
+            self._extracting = False
+
+    def _schedule_memory_extraction(self, conversation: ConversationManager) -> None:
+        if self.memory_manager is None or self._extracting:
+            return
+        task = asyncio.ensure_future(self._extract_memories(conversation))
+        self._memory_tasks.add(task)
+        task.add_done_callback(self._memory_tasks.discard)
+
+    async def flush_memories(
+        self,
+        conversation: ConversationManager | None = None,
+        *,
+        force: bool = False,
+    ) -> None:
+        """Finish pending extraction and optionally schedule the latest delta."""
+        if force and self.memory_manager is not None:
+            self._schedule_memory_extraction(conversation or self.conversation)
+        if self._memory_tasks:
+            await asyncio.gather(*tuple(self._memory_tasks), return_exceptions=True)
 
     async def run(self, conversation: ConversationManager | str) -> AsyncIterator[AgentEvent]:
         """Run until the model stops requesting tools or a structured stop condition fires.
@@ -565,21 +727,60 @@ class Agent:
         consecutive_unknown = 0
         max_token_recoveries = 0
 
-        for event in await self._run_hook("session_start"):
+        initial_message = self._latest_message_text(active)
+        evidence_tracker = RunEvidenceTracker(self.work_dir, initial_message)
+        evidence_tracker.plan_pending = (
+            self._pending_plan_execution and self.permission_mode is not PermissionMode.PLAN
+        )
+        agent_tool = self._registered_tool("Agent")
+        task_manager = getattr(agent_tool, "task_manager", None)
+        list_tasks = getattr(task_manager, "list_tasks", None)
+        if callable(list_tasks):
+            evidence_tracker.background_pending = any(
+                getattr(task, "status", "") == "running" for task in list_tasks()
+            )
+        for event in await self._run_hook("session_start", message=initial_message):
             yield event
-        for event in await self._run_hook("turn_start"):
+        for event in await self._run_hook("turn_start", message=initial_message):
             yield event
 
         for iteration in range(1, self.max_iterations + 1):
             self._consume_mailbox(active)
-            apply_tool_result_budget(active)
-            compacted = auto_compact(active, self.context_window, self.compact_breaker)
+            # Skills can be activated by a tool in the preceding iteration. Rebuild the
+            # pinned environment before every provider request so the new SOP is visible.
+            self._refresh_dynamic_environment(active)
+            # Layer 1 first: persist large results and commit previews to outer history.
+            self._apply_context_budget(active)
+
+            # Layer 2: may replace the whole outer history when near the window limit.
+            compacted = await auto_compact(
+                active,
+                self.client,
+                self.context_window,
+                self.session_dir,
+                protocol=self.protocol,
+                breaker=self.compact_breaker,
+                recovery=self.recovery_state,
+                tool_schemas=self._skill_filtered_tool_schemas(),
+            )
             if isinstance(compacted, str):
+                for event in await self._error_hook_events(compacted):
+                    yield event
                 yield ErrorEvent(compacted)
                 return
             if isinstance(compacted, CompactEvent):
                 self._inject_context(active, force=True)
-                yield CompactNotification(compacted.removed_messages, compacted.summary)
+                after_tokens = estimate_conversation_tokens(active)
+                active.last_input_tokens = after_tokens
+                for event in await self._run_hook(
+                    "compact",
+                    message=f"{compacted.before_tokens} -> {after_tokens}",
+                ):
+                    yield event
+                yield CompactNotification(
+                    compacted.before_tokens,
+                    after_tokens,
+                )
 
             if self._mode_transition_reminder is not None:
                 active.add_system_reminder(self._mode_transition_reminder)
@@ -591,20 +792,33 @@ class Agent:
                     build_plan_mode_reminder(plan_path, plan_path.exists(), iteration)
                 )
 
-            for event in await self._run_hook("pre_send"):
+            for event in await self._run_hook(
+                "pre_send",
+                message=self._latest_message_text(active),
+            ):
                 yield event
+
+            # Reminders/environment added after compaction also count toward the window.
+            active.last_input_tokens = max(
+                active.last_input_tokens,
+                estimate_conversation_tokens(active),
+            )
 
             collector = StreamCollector()
             stream = self.client.stream(
                 active,
                 system=self._system_prompt(),
-                tools=self.registry.get_all_schemas(self.protocol) or None,
+                tools=self._skill_filtered_tool_schemas() or None,
             )
             async for stream_event in collector.consume(stream):
                 yield stream_event
             response = collector.response()
+            active.last_input_tokens = max(
+                response.input_tokens,
+                estimate_conversation_tokens(active),
+            )
 
-            for event in await self._run_hook("post_receive"):
+            for event in await self._run_hook("post_receive", message=response.text):
                 yield event
 
             self.total_input_tokens += response.input_tokens
@@ -637,9 +851,58 @@ class Agent:
 
             self._append_response(active, response)
             if not response.tool_calls:
+                evidence: EvidenceBundle | None = None
+                outcome: Literal["answered", "completed", "waiting_background"] = "answered"
+                if callable(list_tasks):
+                    evidence_tracker.background_pending = any(
+                        getattr(task, "status", "") == "running" for task in list_tasks()
+                    )
+                if self.completion_gate_enabled and evidence_tracker.gate_required:
+                    yield VerificationEvent("started")
+                    verified = await evidence_tracker.verify(response.text)
+                    if verified.outcome == "verification_failed":
+                        yield VerificationEvent("failed", verified)
+                        if evidence_tracker.repair_attempts < 2:
+                            evidence_tracker.repair_attempts += 1
+                            active.add_system_reminder(evidence_tracker.repair_message(verified))
+                            yield RetryEvent(
+                                f"completion verification repair "
+                                f"{evidence_tracker.repair_attempts}/2"
+                            )
+                            continue
+                        message = "Completion verification failed after 2 repair attempts."
+                        for event in await self._run_hook("turn_end"):
+                            yield event
+                        for event in await self._run_hook("session_end"):
+                            yield event
+                        yield LoopComplete(
+                            response.stop_reason,
+                            turn_input_tokens,
+                            turn_output_tokens,
+                            "verification_failed",
+                            verified,
+                        )
+                        for event in await self._error_hook_events(message):
+                            yield event
+                        yield ErrorEvent(message)
+                        return
+                    evidence = verified
+                    outcome = cast(
+                        Literal["answered", "completed", "waiting_background"],
+                        verified.outcome,
+                    )
+                    yield VerificationEvent("passed", verified)
+                    if (
+                        self.permission_mode is not PermissionMode.PLAN
+                        and verified.outcome == "completed"
+                        and evidence_tracker.saw_successful_execution
+                        and not evidence_tracker.background_pending
+                    ):
+                        self._pending_plan_execution = False
                 self._completed_turns += 1
-                if self._completed_turns % MEMORY_EXTRACTION_INTERVAL == 0:
-                    await self._maybe_extract_memory(active)
+                self._loop_count += 1
+                if self._loop_count % MEMORY_EXTRACTION_INTERVAL == 0:
+                    self._schedule_memory_extraction(active)
                 for event in await self._run_hook("turn_end"):
                     yield event
                 for event in await self._run_hook("session_end"):
@@ -648,12 +911,22 @@ class Agent:
                     response.stop_reason,
                     turn_input_tokens,
                     turn_output_tokens,
+                    outcome,
+                    evidence,
                 )
                 return
 
             result_blocks: list[ToolResultBlock] = []
             unknown_in_round = False
-            for batch in partition_tool_calls(response.tool_calls, self.registry):
+            for batch_index, batch in enumerate(
+                partition_tool_calls(response.tool_calls, self.registry),
+                start=1,
+            ):
+                yield ToolBatchEvent(
+                    f"{iteration}-{batch_index}",
+                    tuple(call.tool_id for call in batch.calls),
+                    batch.concurrent,
+                )
                 if batch.concurrent and len(batch.calls) > 1:
                     results = await self._execute_batch_parallel(batch.calls)
                     for hook_event in self._drain_hook_events():
@@ -668,7 +941,23 @@ class Agent:
                                 yield item
 
                 for result in results:
-                    output = self._maybe_persist_or_truncate(result.tool_id, result.output)
+                    result_value = result.result or ToolResult(
+                        result.output,
+                        is_error=result.is_error,
+                    )
+                    registered = self._registered_tool(result.tool_name)
+                    arguments = self._arguments_for(response.tool_calls, result.tool_id) or {}
+                    evidence_tracker.record(
+                        result.tool_name,
+                        str(getattr(registered, "category", "read")),
+                        arguments,
+                        result_value,
+                        result.elapsed,
+                    )
+                    if result.tool_name == WritePlanTool.name and not result.is_error:
+                        self._pending_plan_execution = True
+                    # Keep it until the next loop starts; Layer 1 then persists and commits preview.
+                    output = result.output
                     result_blocks.append(
                         ToolResultBlock(result.tool_id, output, is_error=result.is_error)
                     )
@@ -679,36 +968,52 @@ class Agent:
                         "result",
                         output,
                         is_error=result.is_error,
-                        arguments=self._arguments_for(response.tool_calls, result.tool_id),
+                        arguments=arguments,
                         elapsed_seconds=result.elapsed,
+                        data=result_value.data,
+                        preview=result_value.preview,
+                        artifact_path=result_value.artifact_path,
+                        exit_code=result_value.exit_code,
+                        diagnostics=result_value.diagnostics,
                     )
 
             active.add_tool_results_message(result_blocks)
             yield TurnComplete(response.stop_reason, turn_input_tokens, turn_output_tokens)
             consecutive_unknown = consecutive_unknown + 1 if unknown_in_round else 0
             if consecutive_unknown >= 3:
-                yield ErrorEvent("Agent stopped after 3 consecutive unknown-tool rounds.")
+                message = "Agent stopped after 3 consecutive unknown-tool rounds."
+                for event in await self._error_hook_events(message):
+                    yield event
+                yield ErrorEvent(message)
                 return
 
-        yield ErrorEvent(f"Agent exceeded max iterations: {self.max_iterations}")
+        message = f"Agent exceeded max iterations: {self.max_iterations}"
+        for event in await self._error_hook_events(message):
+            yield event
+        yield ErrorEvent(message)
 
     async def run_to_completion(
         self,
         prompt: str,
         conversation: ConversationManager | None = None,
     ) -> str:
-        """Run the event loop and return its generated text for synchronous callers."""
+        """Run non-interactively and return the final model turn's text."""
 
         active = conversation or self.conversation
         if prompt:
             active.add_user_message(prompt)
-        chunks: list[str] = []
+        current_turn: list[str] = []
+        previous_turn: list[str] = []
         async for event in self.run(active):
             if isinstance(event, StreamText):
-                chunks.append(event.text)
+                current_turn.append(event.text)
+            elif isinstance(event, TurnComplete):
+                if current_turn:
+                    previous_turn = current_turn
+                    current_turn = []
             elif isinstance(event, ErrorEvent):
                 raise RuntimeError(event.message)
-        return "".join(chunks)
+        return "".join(current_turn or previous_turn)
 
     @staticmethod
     def _arguments_for(calls: list[ToolCallComplete], tool_id: str) -> dict[str, Any] | None:
@@ -722,20 +1027,6 @@ class Agent:
 
     async def _execute_allowed(self, call: ToolCallComplete) -> _ToolExecResult:
         started = perf_counter()
-        context = self._build_hook_context(
-            "pre_tool_use",
-            tool_name=call.tool_name,
-            arguments=call.arguments,
-        )
-        pre_hook = await self.hook_engine.run_pre_tool_hooks(context)
-        if not pre_hook.allowed:
-            return _ToolExecResult(
-                call.tool_id,
-                call.tool_name,
-                f"Hook rejected: {pre_hook.reason}",
-                max(0.0, perf_counter() - started),
-                is_error=True,
-            )
         result = await self.registry.execute(call.tool_name, call.arguments, truncate=False)
         await self.hook_engine.run_hooks(
             "post_tool_use",
@@ -743,19 +1034,70 @@ class Agent:
                 "post_tool_use",
                 tool_name=call.tool_name,
                 arguments=call.arguments,
+                message=result.output,
                 result=result.output,
             ),
         )
-        return _ToolExecResult(
+        if not result.is_error:
+            tool = self._registered_tool(call.tool_name)
+            if tool is not None and tool.category == "write":
+                file_path = self._infer_file_path(call.arguments) or ""
+                await self.hook_engine.run_hooks(
+                    "file_change",
+                    self._build_hook_context(
+                        "file_change",
+                        tool_name=call.tool_name,
+                        arguments=call.arguments,
+                        file_path=file_path,
+                        message=result.output,
+                        result=result.output,
+                    ),
+                )
+        self.hook_prompts.extend(self.hook_engine.get_prompt_messages())
+        exec_result = _ToolExecResult(
             call.tool_id,
             call.tool_name,
             result.output,
             max(0.0, perf_counter() - started),
             is_error=result.is_error,
+            result=result,
+        )
+        self._snapshot_for_recovery(call, exec_result)
+        return exec_result
+
+    async def _run_pre_tool_hook(
+        self,
+        call: ToolCallComplete,
+        started: float,
+    ) -> _ToolExecResult | None:
+        rejection = await self.hook_engine.run_pre_tool_hooks(
+            self._build_hook_context(
+                "pre_tool_use",
+                tool_name=call.tool_name,
+                arguments=call.arguments,
+            )
+        )
+        self.hook_prompts.extend(self.hook_engine.get_prompt_messages())
+        if rejection is None:
+            return None
+        return _ToolExecResult(
+            call.tool_id,
+            call.tool_name,
+            f"Hook rejected: {rejection.reason}",
+            max(0.0, perf_counter() - started),
+            is_error=True,
         )
 
     async def _execute_single_tool_direct(self, call: ToolCallComplete) -> _ToolExecResult:
         started = perf_counter()
+        if not self._tool_allowed_by_active_skills(call.tool_name):
+            return _ToolExecResult(
+                call.tool_id,
+                call.tool_name,
+                f"Permission denied: active Skill tool whitelist excludes {call.tool_name}.",
+                max(0.0, perf_counter() - started),
+                is_error=True,
+            )
         tool = self._registered_tool(call.tool_name)
         if tool is None:
             return _ToolExecResult(
@@ -774,6 +1116,9 @@ class Agent:
                 max(0.0, perf_counter() - started),
                 is_error=True,
             )
+        rejection = await self._run_pre_tool_hook(call, started)
+        if rejection is not None:
+            return rejection
         decision = self.permission_checker.check(tool, call.arguments)
         if decision.effect == "deny":
             return _ToolExecResult(
@@ -802,9 +1147,26 @@ class Agent:
     async def _execute_tool(
         self, call: ToolCallComplete
     ) -> AsyncIterator[PermissionRequest | HookEvent | _ToolExecResult]:
+        if not self._tool_allowed_by_active_skills(call.tool_name):
+            yield _ToolExecResult(
+                call.tool_id,
+                call.tool_name,
+                f"Permission denied: active Skill tool whitelist excludes {call.tool_name}.",
+                0.0,
+                is_error=True,
+            )
+            return
         tool = self._registered_tool(call.tool_name)
         if tool is None or not self.registry.is_enabled(call.tool_name):
             yield await self._execute_single_tool_direct(call)
+            return
+
+        started = perf_counter()
+        rejection = await self._run_pre_tool_hook(call, started)
+        for event in self._drain_hook_events():
+            yield event
+        if rejection is not None:
+            yield rejection
             return
 
         decision = self.permission_checker.check(tool, call.arguments)
@@ -818,12 +1180,22 @@ class Agent:
             )
             return
         if decision.effect == "ask":
+            for event in await self._run_hook(
+                "permission_request",
+                tool_name=call.tool_name,
+                arguments=call.arguments,
+                message=decision.reason,
+            ):
+                yield event
             future: asyncio.Future[PermissionResponse] = asyncio.get_running_loop().create_future()
             yield PermissionRequest(
                 call.tool_id,
                 call.tool_name,
                 dict(call.arguments),
                 future,
+                reason=decision.reason,
+                work_dir=str(self.work_dir),
+                argument_hash=permission_argument_hash(call.tool_name, call.arguments),
             )
             response = await future
             if response is PermissionResponse.DENY:
@@ -841,8 +1213,17 @@ class Agent:
                     representative = self._infer_file_path(call.arguments) or str(
                         next(iter(call.arguments.values()), "")
                     )
+                representative = normalize_permission_content(call.tool_name, representative)
                 self.permission_checker.rule_engine.append_local_rule(
-                    Rule(call.tool_name, representative[:60] + "*")
+                    Rule(
+                        call.tool_name,
+                        representative,
+                        match_mode="exact",
+                        argument_hash=permission_argument_hash(
+                            call.tool_name,
+                            call.arguments,
+                        ),
+                    )
                 )
 
         result = await self._execute_allowed(call)
@@ -850,16 +1231,70 @@ class Agent:
             yield event
         yield result
 
-    def _maybe_persist_or_truncate(self, tool_id: str, output: str) -> str:
-        if len(output) > SINGLE_RESULT_CHAR_LIMIT:
-            try:
-                path = persist_tool_result(self.session_dir, tool_id, output)
-                return make_persisted_preview(output, path)
-            except OSError:
-                pass
-        if len(output) > MAX_OUTPUT_CHARS:
-            return output[:MAX_OUTPUT_CHARS] + "\n… (output truncated)"
-        return output
+    def activate_skill(
+        self,
+        name: str,
+        body: str,
+        allowed_tools: tuple[str, ...] | list[str] = (),
+    ) -> None:
+        """Pin a skill SOP into the environment context for subsequent turns."""
+        self.active_skills[name] = body
+        self._active_skill_allowed_tools[name] = tuple(allowed_tools)
+
+    def clear_active_skills(self) -> None:
+        self.active_skills.clear()
+        self._active_skill_allowed_tools.clear()
+
+    def set_skill_catalog(self, catalog: str) -> None:
+        self._skill_catalog = catalog.strip()
+
+    def set_agent_catalog(self, catalog: str) -> None:
+        self._agent_catalog = catalog.strip()
+
+    def _snapshot_for_recovery(self, tc: ToolCallComplete, result: _ToolExecResult) -> None:
+        if result.is_error or tc.tool_name != "ReadFile":
+            return
+        file_path = tc.arguments.get("file_path") or tc.arguments.get("path")
+        if not isinstance(file_path, str) or not file_path:
+            return
+        try:
+            content = Path(file_path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return
+        self.recovery_state.record_file_read(file_path, content)
+
+    async def manual_compact(
+        self,
+        conversation: ConversationManager | None = None,
+    ) -> CompactNotification | ErrorEvent:
+        """User-triggered compact (`/compact`); uses the tighter manual safety margin."""
+        active = conversation or self.conversation
+        compacted = await auto_compact(
+            active,
+            self.client,
+            self.context_window,
+            self.session_dir,
+            protocol=self.protocol,
+            manual=True,
+            breaker=self.compact_breaker,
+            recovery=self.recovery_state,
+            tool_schemas=self._skill_filtered_tool_schemas(),
+        )
+        if isinstance(compacted, CompactEvent):
+            self._inject_context(active, force=True)
+            after_tokens = estimate_conversation_tokens(active)
+            active.last_input_tokens = after_tokens
+            await self._run_hook(
+                "compact",
+                message=f"{compacted.before_tokens} -> {after_tokens}",
+            )
+            return CompactNotification(compacted.before_tokens, after_tokens)
+        if isinstance(compacted, str):
+            await self._run_hook("error", error=compacted, message=compacted)
+            return ErrorEvent(compacted)
+        message = "Nothing to compact."
+        await self._run_hook("error", error=message, message=message)
+        return ErrorEvent(message)
 
 
 __all__ = [
@@ -882,8 +1317,10 @@ __all__ = [
     "ThinkingText",
     "ToolBatch",
     "ToolResultEvent",
+    "ToolBatchEvent",
     "ToolUseEvent",
     "TurnComplete",
     "UsageEvent",
+    "VerificationEvent",
     "partition_tool_calls",
 ]

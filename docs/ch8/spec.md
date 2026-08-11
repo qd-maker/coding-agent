@@ -4,17 +4,18 @@
 
 LLM 上下文窗口有上限，但长任务里 tool result（Bash 输出、长文件）很容易在几轮内把窗口顶爆。没有上下文管理就意味着 Agent 跑到一半被 API 退回 `prompt_too_long`，会话失败、上下文丢失、用户得手动重启。
 
-本章用「先廉价救火再花钱总结」两层策略解决：第 1 层不调 LLM，只做本地写盘 + 决策记录；第 2 层在 `last_input_tokens` 过阈值时整段摘要。第 1 层加一个跨轮持久的「替换决策日志」 `ContentReplacementState`，让每个 tool result 的「替换/不替换」决定只做一次、之后字节相同地复读 —— 这是 Anthropic prompt cache 命中所需的前缀稳定性的关键。
+本章用「先廉价救火再花钱总结」两层策略解决：第 1 层不调 LLM，只做本地写盘 + 决策记录；第 2 层在当前上下文 Token 估算过阈值时整段摘要。Token 使用本地字符启发式近似，并与 Provider 最近一次报告值取较大者。第 1 层加一个跨轮持久的「替换决策日志」 `ContentReplacementState`，让每个 tool result 的「替换/不替换」决定只做一次、之后字节相同地复读 —— 这是 Anthropic prompt cache 命中所需的前缀稳定性的关键。
 
 ## 2. 目标
 
 交付一套两层上下文管理 + 压缩后恢复：
 
 - **Layer 1**：`apply_tool_result_budget(conversation, session_dir, state)` 每轮 agent loop 都跑。读取 `ContentReplacementState` 已记录的决策，对新候选评估「单条超限」和「聚合超限」两条规则；选中的 tool result 写盘换 `<persisted-output>` preview 字符串，决定写入 state；过 `KEEP_RECENT_TURNS` 轮的陈旧 tool result 裁为 `<snipped>` 一段。返回**新的** `ConversationManager`，原 conversation 不动。新决策追加写到 `<session_dir>/replacement_records.jsonl`。
-- **Layer 2**：`auto_compact(conversation, client, context_window, session_dir, ...)` 在 `conversation.last_input_tokens >= threshold` 时调 LLM 拼摘要，把整段会话换成 `[摘要]` + 边界消息两条。`CompactCircuitBreaker` 连续失败 `max_failures` 次后熔断不再发请求。
+- **Token 估算**：`estimate_conversation_tokens` 统计文本、thinking、tool input/result 与固定消息开销；ASCII 约 4 chars/token，非 ASCII 约 1 char/token。
+- **Layer 2**：`auto_compact(conversation, client, context_window, session_dir, ...)` 在 `max(conversation.last_input_tokens, estimate_conversation_tokens(conversation)) >= threshold` 时调 LLM 拼摘要，把整段会话换成 `[摘要]` + 边界消息两条。`CompactCircuitBreaker` 连续失败 `max_failures` 次后熔断不再发请求。
 - **Layer 2 后恢复**：`RecoveryState` 跨轮记录每次 ReadFile 的字节快照与每次 Skill 调用的 SOP 文本。`auto_compact` 在拼出摘要、构造新会话之前先调 `build_recovery_attachment(state, tool_schemas)`，把「最近读过的文件 / 已激活的技能 / 当前可用工具 / 收尾提示」四段拼到摘要 user 消息末尾，避免摘要替换后模型瞬间失去工作记忆。
 
-两层在 Agent 主循环里串联：Layer 2 先跑（决定是否整段摘要 + 恢复，需要时**就地** mutate `conversation.history`）→ 写入各种 system reminder → Layer 1 在 `client.stream` 调用前最后一刻跑、把 `api_conv` 喂给 LLM。手动入口 `manual_compact` 给 `/compact` 用，切到 `MANUAL_COMPACT_SAFETY_MARGIN` 更小的安全余量直接走 Layer 2。
+两层在 Agent 主循环里串联：Layer 1 先把大结果落盘并由 Agent 显式提交回外层历史 → 刷新 Token 估算 → Layer 2 决定是否整段摘要 + 恢复并在需要时**就地**替换 `conversation.history` → 写入各种 system reminder → 发送同一个外层 `ConversationManager`。手动入口 `manual_compact` 给 `/compact` 用，对任意非空会话直接走 Layer 2，并显示压缩前后的 Token 变化。
 
 Anthropic 客户端在 system / tools 末项 / 最后一条 user message 末尾三处加 `cache_control: {"type": "ephemeral"}` 标记；配合 Layer 1 的字节稳定 replacements，前缀缓存就能命中。
 
@@ -22,6 +23,7 @@ Anthropic 客户端在 system / tools 末项 / 最后一条 user message 末尾�
 
 ### 3.1 状态容器与持久化
 
+- F0: `estimate_text_tokens` / `estimate_message_tokens` / `estimate_conversation_tokens` 全部为本地纯函数；统计消息文本、thinking、tool name/id、input JSON、result content 与固定消息开销。ASCII 按 4 chars/token、非 ASCII 按 1 char/token 并向上取整。
 - F1: `ContentReplacementState` dataclass（`seen_ids: set[str]` + `replacements: dict[str, str]`），以及 `create_replacement_state()` / `clone_replacement_state(src)` 两个工厂。`seen_ids` 收录每个判断过的 `tool_use_id`，`replacements` 仅收录决定「替换」的那些 id 到 preview 字符串。不变量：`replacements.keys() ⊆ seen_ids`。
 - F2: `ContentReplacementRecord` dataclass（`tool_use_id`, `replacement`, `kind="tool-result"`），及 JSONL I/O：
   - `append_replacement_records(session_dir, records)`：空切片直接 return；用 `open("a", encoding="utf-8")` 追加，每行一个 JSON 对象。
@@ -42,13 +44,13 @@ Anthropic 客户端在 system / tools 末项 / 最后一条 user message 末尾�
 
 ### 3.3 Layer 2 摘要
 
-- F9: 阈值计算 `compute_compact_threshold(context_window, manual=False)`，公式 `window - SUMMARY_OUTPUT_RESERVE - (MANUAL_COMPACT_SAFETY_MARGIN if manual else AUTO_COMPACT_SAFETY_MARGIN)`；`should_auto_compact(last_input_tokens, context_window)` 给布尔。
+- F9: 阈值计算 `compute_compact_threshold(context_window, manual=False)`，公式 `window - SUMMARY_OUTPUT_RESERVE - (MANUAL_COMPACT_SAFETY_MARGIN if manual else AUTO_COMPACT_SAFETY_MARGIN)`；`should_auto_compact(last_input_tokens, context_window)` 给布尔。`auto_compact` 进入判断前把 Provider 报告值与本地估算取最大值。
 - F10: `auto_compact` 流程：把当前 conversation 全量塞进临时 `ConversationManager` + `SUMMARY_PROMPT` 包装 → 通过 `client.stream(...)` 收 `TextDelta` 拼成完整文本 → `extract_summary` 剥 `<analysis>`、保留 `<summary>` → `build_compact_messages` 构造 `[摘要] + 边界消息` 替换原会话 → `cleanup_tool_results` 清空 session 目录。
 - F11: 摘要后处理 `extract_summary` 容错：找到 `<summary>`/`</summary>` 标签对取内部 trim；找不到完整标签对则返回原文整体，绝不丢摘要。
 - F12: 摘要 prompt `SUMMARY_PROMPT` 强制九节结构（主要请求、关键概念、文件与代码段、错误与修复、解决过程、用户原话、待办、当前工作、下一步），并明确禁止工具调用、要求先 `<analysis>` 再 `<summary>`。
 - F13: 熔断器 `CompactCircuitBreaker(max_failures=3)` 含 `record_failure / record_success / is_open` 三方法；自动模式下 `is_open()` 时 `auto_compact` 直接回错误字符串不发摘要请求。
 - F14: PTL 重试：摘要请求自身报 `prompt too long` 时，`_group_messages_by_turn` 把对话按轮分组、丢掉最旧 1/5，最多重试 3 次；耗尽后 `breaker.record_failure()` 并返回错误字符串。
-- F15: 手动入口 `manual_compact`：直接调 `auto_compact(..., manual=True)`，跳过 Layer 1 调用，安全余量切到 `MANUAL_COMPACT_SAFETY_MARGIN = 3_000`，对话不为空就压。
+- F15: 手动入口 `manual_compact`：直接调 `auto_compact(..., manual=True)`，跳过 Layer 1 调用，安全余量切到 `MANUAL_COMPACT_SAFETY_MARGIN = 3_000`，对话不为空就压；`CompactEvent / CompactNotification` 同时携带 `before_tokens / after_tokens`，TUI 显示前后变化。
 
 ### 3.4 Anthropic 缓存断点与集成
 
@@ -56,7 +58,7 @@ Anthropic 客户端在 system / tools 末项 / 最后一条 user message 末尾�
   - `system` 参数包装成 `[{"type":"text","text":system,"cache_control":{"type":"ephemeral"}}]`。
   - `tools` 末项的 schema dict 加 `"cache_control":{"type":"ephemeral"}`（用 `_mark_last_tool_for_cache` 浅拷贝避免污染调用方的工具表）。
   - 最后一条 user message 的末块用 `_mark_last_user_tail_for_cache` 原地打 marker（string content 自动 up-convert 为 block 列表）。
-- F17: `Agent.__init__` 把 `self.replacement_state = create_replacement_state()` 初始化为空容器；三处 `apply_tool_result_budget` 调用点（main loop / manual_compact / 另一主循环变体）都传 `self.replacement_state` 并把 new records 写入 transcript。
+- F17: `Agent.__init__` 把 `self.replacement_state = create_replacement_state()` 初始化为空容器；主循环每轮把 `apply_tool_result_budget` 返回的新 history、注入 flags 与 Token 状态提交回原 `ConversationManager`，把 new records 写入 transcript，并把 Provider 返回的本轮 `input_tokens` 回写外层会话。
 - F18: Fork 子 Agent 路径 `mewcode/tools/agent_tool.py` 创建 sub_agent 后判断 `p.subagent_type is None`（即真 fork）时 `sub_agent.replacement_state = clone_replacement_state(self._parent_agent.replacement_state)`。
 
 ### 3.5 压缩后恢复
@@ -71,11 +73,11 @@ Anthropic 客户端在 system / tools 末项 / 最后一条 user message 末尾�
 ## 4. 非功能需求
 
 - N1: Layer 1 必须廉价：纯本地文件 I/O + 字符串改写，不调 LLM；每轮 agent loop 都跑也不能成为瓶颈。
-- N2: `apply_tool_result_budget` 不能 mutate 入参 `conversation` —— 通过新建 `Message` / `ToolResultBlock` 实例 + 重组 `new_history` 产出 api_conv。测试用 `test_apply_does_not_mutate_conv` 守住。
+- N2: `apply_tool_result_budget` 不能 mutate 入参 `conversation` —— 通过新建 `Message` / `ToolResultBlock` 实例 + 重组 `new_history` 产出 api_conv。Agent Loop 是唯一负责把结果显式提交回外层 history 的边界。测试同时覆盖函数不变性和 Loop 回写。
 - N3: 已决策 id 的复读必须**字节一致**：从 `state.replacements` 拿出来的字符串直接赋给 `decisions[id]`，不重新读盘、不重新格式化。这是 prompt cache 命中的硬约束。
 - N4: spill 写盘幂等：用 `O_CREAT | O_EXCL`，同 `tool_use_id` 重复运行写同一份内容，已存在则 `FileExistsError` 静默跳过；spill 文件路径稳定（`<work_dir>/.mewcode/session/tool-results/<tool_use_id>.txt`），不含时间戳。
 - N5: Layer 2 期间不能再触发新的 tool call —— 摘要走的是临时 `ConversationManager` + `SUMMARY_PROMPT` 一次性 stream，不绕回 agent 主循环。
-- N6: `auto_compact` 替换 conversation 用 `conversation.replace_history(...)` 就地写法，让调用方持有的 `ConversationManager` 引用保持有效。
+- N6: `auto_compact` 替换 conversation 用 `conversation.replace_history(...)` 就地写法，让调用方持有的 `ConversationManager` 引用保持有效；替换后立即重新估算并覆盖陈旧的 `last_input_tokens`，避免下一轮重复压缩。
 - N7: 当 `breaker is None`（测试或一次性脚本场景）熔断器禁用，不能崩。
 - N8: 阈值用固定常量（`SUMMARY_OUTPUT_RESERVE = 20_000` / `AUTO_COMPACT_SAFETY_MARGIN = 13_000`）而不是百分比，确保 200K / 1M 等不同窗口下 buffer 大小一致。
 - N9: 子 Agent fork 的 state 必须是父 state 的**独立深拷贝**：子端 mutate 不影响父端，反向亦然。`set(src)` 和 `dict(src)` 浅拷贝足够（值是字符串和 hash key，不需要 deepcopy）。测试用 `test_clone_independent` 守住。
@@ -86,22 +88,29 @@ Anthropic 客户端在 system / tools 末项 / 最后一条 user message 末尾�
 
 - 核心模块结构 (`mewcode/context/manager.py`):
   - 常量段（顶部）：阈值、tag、session 子目录。
+  - Token 估算段：`estimate_text_tokens / estimate_message_tokens /
+    estimate_conversation_tokens`。
   - 状态段：`ContentReplacementState` / `ContentReplacementRecord` / `create_replacement_state` / `clone_replacement_state` / `reconstruct_replacement_state` / `append_replacement_records` / `load_replacement_records` / `REPLACEMENT_RECORDS_FILENAME`。
   - Session 段：`ensure_session_dir` / `cleanup_tool_results`。
   - Layer 1 段：`persist_tool_result` / `make_persisted_preview` / `_count_turns` / `_copy_message_with_results` / `_snip_stale_messages` / `apply_tool_result_budget`。
   - Layer 2 段：`compute_compact_threshold` / `should_auto_compact` / `SUMMARY_PROMPT` / `extract_summary` / `COMPACT_BOUNDARY_MESSAGE` / `build_compact_messages` / `_group_messages_by_turn` / `CompactCircuitBreaker` / `auto_compact`。
   - 恢复段：`RECOVERY_FILE_LIMIT / RECOVERY_TOKENS_PER_FILE / RECOVERY_SKILLS_BUDGET / RECOVERY_TOKENS_PER_SKILL / _RECOVERY_CHARS_PER_TOKEN` 常量 / `FileReadRecord` / `SkillInvocationRecord` dataclass / `RecoveryState` 类 + `record_file_read` / `record_skill_invocation` / `snapshot_files` / `snapshot_skills` / `_approx_tokens` / `_truncate_by_tokens` / `_first_line` / `build_recovery_attachment`。`mewcode/context/__init__.py` re-export 类名 + 工厂 + builder。
 - 主流程（每轮 agent loop）:
-  - 主循环开头：`compact_result = await auto_compact(conversation, client, context_window, session_dir, ..., recovery=self.recovery_state, tool_schemas=self.registry.get_all_schemas(self.protocol))` 内部按阈值决定是否真做摘要；成功时 yield `CompactNotification` + 重新 `inject_environment` / `inject_long_term_memory`。
-  - 各种 system reminder 写入 conversation。
-  - 在 `client.stream` 调用前一刻：`api_conv, new_records = apply_tool_result_budget(conversation, self.session_dir, self.replacement_state)` → `append_replacement_records(self.session_dir, new_records)` → `client.stream(api_conv, ...)`。
+  - 主循环开头：`apply_tool_result_budget` 先落盘，把返回 history/flags/token 提交回原
+    conversation，并追加 replacement records。
+  - 用本地估算刷新 `last_input_tokens`，再调用 `auto_compact(...)`；成功时就地替换历史、
+    yield `CompactNotification(before_tokens, after_tokens)` 并重新注入 environment / memory。
+  - 各种 system reminder 写入 conversation 后再次刷新估算，`client.stream` 直接接收同一个
+    外层 conversation；stream 完成后把 Provider `input_tokens` 回写。
 - 主流程（工具调用快照）:
   - `Agent._execute_single_tool_direct` / `Agent._execute_tool` 在 `tool.execute(params)` 之后调 `self._snapshot_for_recovery(tc, result)`；命中 ReadFile + 非错误时按原路径打开文件读字节写入 `self.recovery_state`。
 - 主流程（Skill 调用快照）:
   - 用户输入 `/<skill-name>` → 命令分发到 `SkillExecutor.execute_inline` 或 `execute_fork` → 在改 `self.agent.activate_skill` / 起 fork_conv 之前先 `self.agent.recovery_state.record_skill_invocation(...)`。
 - 主流程（手动 `/compact`）:
-  - 用户输入 `/compact` → `COMPACT_COMMAND.handler = handle_compact` → 读 `ctx.ui.get_token_count()`，<5000 直接提示无需压缩；否则调 `ctx.agent.manual_compact(ctx.conversation)`。
-  - `Agent.manual_compact` 直接调 `auto_compact(..., manual=True)`，拿到 `CompactEvent` 包成 `CompactNotification`，否则返回 `ErrorEvent`。
+  - 用户输入 `/compact` → `handle_compact` 对非空会话刷新本地估算 →
+    `ctx.agent.manual_compact(ctx.conversation)`。
+  - `Agent.manual_compact` 直接调 `auto_compact(..., manual=True)`，拿到 `CompactEvent` 包成
+    `CompactNotification`，TUI 显示 `before_tokens → after_tokens`；失败返回 `ErrorEvent`。
 - 主流程（fork 子 Agent）:
   - `AgentTool.execute` 触发 fork → 创建 sub_agent → 当 `p.subagent_type is None` 时 `sub_agent.replacement_state = clone_replacement_state(self._parent_agent.replacement_state)` → 子 Agent 用克隆状态独立演化。
 - Anthropic 客户端缓存断点（`mewcode/client.py`）:

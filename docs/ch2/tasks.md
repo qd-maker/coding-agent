@@ -27,7 +27,7 @@
 - 完成标准:
  - `mewcode/client.py:56-63` 实现 `_supports_adaptive_thinking(model)`：扫描 `claude-opus-4-` / `claude-sonnet-4-` 前缀且后续首字符 `>= '6'`；
  - `mewcode/client.py:65-78` 实现 `__init__`：从 `ProviderConfig.resolve_api_key()` 取 key，无 key 时直接抛 `AuthenticationError`；构造 `AsyncAnthropic(api_key, base_url)`；
- - `mewcode/client.py:81-174` 实现 `async def stream`：序列化 `conversation.serialize("anthropic")` → 拼 `kwargs` → 按 `_supports_adaptive_thinking` 分流 thinking → `async with self._client.messages.stream(**kwargs) as stream: async for event in stream` 解析 `content_block_start` / `content_block_delta`（thinking_delta / signature_delta / text_delta / input_json_delta）/ `content_block_stop` / `message_stop`，最后 `await stream.get_final_message()` 拿 usage 与 stop_reason；
+ - `mewcode/client.py` 实现 `async def stream`：序列化 `conversation.serialize("anthropic")` → 拼 `kwargs` → 按 `_supports_adaptive_thinking` 分流 adaptive/fixed-budget thinking → `async with self._client.messages.stream(**kwargs) as stream: async for event in stream` 解析 `content_block_start` / `content_block_delta`（thinking_delta / signature_delta / text_delta / input_json_delta）/ `content_block_stop`，最后 `await stream.get_final_message()` 拿 usage 与 stop_reason；
  - `mewcode/client.py:176-187` 实现错误分类 `except` 链：`anthropic.AuthenticationError` → `AuthenticationError`；`anthropic.RateLimitError` → `RateLimitError(retry_after=float(retry))`；`anthropic.APIConnectionError` → `NetworkError`；`anthropic.APIStatusError` → `LLMError(API error ({status_code}): ...)`；均 `raise ... from e`。
 
 ## T5: 实现 `OpenAIClient`

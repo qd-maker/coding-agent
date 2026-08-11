@@ -193,3 +193,19 @@ async def test_bash_reports_stdout_nonzero_and_timeout() -> None:
 def test_bash_decodes_windows_chinese_stderr() -> None:
     message = "'rm' 不是内部或外部命令，也不是可运行的程序"
     assert _decode_output(message.encode("gb18030")) == message
+
+
+@pytest.mark.asyncio
+async def test_bash_detaches_stdin_so_readers_dont_hang() -> None:
+    # A command that reads stdin must not inherit the terminal and block; stdin
+    # is detached to DEVNULL so it sees immediate EOF and returns well within
+    # the timeout. Regression for stdio MCP servers / REPLs hanging until kill.
+    executable = str(Path(sys.executable))
+    result = await Bash().execute(
+        BashParams(
+            command=f'"{executable}" -c "import sys; sys.stdout.write(sys.stdin.read())"',
+            timeout=5,
+        )
+    )
+    assert not result.is_error
+    assert "timed out" not in result.output

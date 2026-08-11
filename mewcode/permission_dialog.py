@@ -6,6 +6,7 @@ import json
 from collections.abc import Callable
 
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Vertical
 from textual.widgets import Input, OptionList, Static
 
@@ -95,8 +96,13 @@ class InlineQuestionPrompt(Vertical):
         self._current_options: list[str] = []
 
     def compose(self) -> ComposeResult:
-        yield Static("", classes="inline-prompt-title", markup=False)
-        yield Static("", classes="inline-prompt-message", markup=False)
+        first_message = self.questions[0].message if self.questions else "No question provided."
+        yield Static(
+            f"MewCode question 1/{len(self.questions)}",
+            classes="inline-prompt-title",
+            markup=False,
+        )
+        yield Static(first_message, classes="inline-prompt-message", markup=False)
         yield OptionList(
             classes="inline-prompt-options",
             compact=True,
@@ -205,7 +211,11 @@ class InlinePermissionPrompt(Vertical):
     """Render a three-way permission decision in the conversation flow."""
 
     DEFAULT_CSS = _INLINE_PROMPT_CSS
-    BINDINGS = [("escape", "deny", "Deny")]
+    BINDINGS = [
+        Binding("1,y", "allow", "Allow once", show=False, priority=True),
+        Binding("2,a", "allow_always", "Always allow", show=False, priority=True),
+        Binding("3,n,escape", "deny", "Deny", show=False, priority=True),
+    ]
 
     _RESPONSES = (
         PermissionResponse.ALLOW,
@@ -224,23 +234,22 @@ class InlinePermissionPrompt(Vertical):
         self.completed = False
 
     def compose(self) -> ComposeResult:
-        arguments = json.dumps(self.request.arguments, ensure_ascii=False, indent=2)
         yield Static("MewCode needs permission", classes="inline-prompt-title", markup=False)
         yield Static(
-            f"{self.request.tool_name}\n{arguments}",
+            self._permission_summary(),
             classes="inline-prompt-message",
             markup=False,
         )
         yield OptionList(
             "1. Yes",
-            "2. Yes, and don't ask again for this pattern",
+            "2. Always allow this exact request",
             "3. No",
             classes="inline-prompt-options",
             compact=True,
             markup=False,
         )
         yield Static(
-            "↑/↓ move · Enter confirm · Esc deny",
+            "Y/1 allow · A/2 always allow exact request · N/3/Esc deny",
             classes="inline-prompt-help",
             markup=False,
         )
@@ -249,6 +258,75 @@ class InlinePermissionPrompt(Vertical):
         options = self.query_one(".inline-prompt-options", OptionList)
         options.highlighted = 0
         options.focus()
+
+    def _permission_summary(self) -> str:
+        arguments = self.request.arguments
+        tool_name = self.request.tool_name
+        lines = [tool_name]
+        affected = arguments.get("file_path") or arguments.get("path")
+        if tool_name == "Bash":
+            command = str(arguments.get("command", ""))
+            referenced_paths = [
+                token.strip("\"'(),")
+                for token in command.split()
+                if "/" in token or "\\" in token
+            ]
+            impact = referenced_paths[:5] or [self.request.work_dir or "current working directory"]
+            lines.extend(
+                [
+                    "",
+                    "Command:",
+                    f"  {command}",
+                    "",
+                    "Potential impact:",
+                    *(f"  {item}" for item in impact),
+                    "File changes: determined after execution",
+                ]
+            )
+            risk = self.request.reason or "Shell command may modify workspace or external state"
+        elif tool_name == "WriteFile":
+            content = str(arguments.get("content", ""))
+            lines.extend(
+                [
+                    "",
+                    "Write target:",
+                    f"  {affected or '(unknown)'}",
+                    (
+                        f"Content: {len(content.splitlines())} lines · "
+                        f"{len(content.encode('utf-8'))} bytes"
+                    ),
+                ]
+            )
+            risk = self.request.reason or "Creates or overwrites a file"
+        elif tool_name == "EditFile":
+            old = str(arguments.get("old_string", ""))
+            new = str(arguments.get("new_string", ""))
+            lines.extend(
+                [
+                    "",
+                    "Edit target:",
+                    f"  {affected or '(unknown)'}",
+                    f"Change: {len(old)} chars → {len(new)} chars",
+                ]
+            )
+            risk = self.request.reason or "Modifies an existing file"
+        else:
+            rendered = json.dumps(arguments, ensure_ascii=False, indent=2)
+            lines.extend(["", "Arguments:", rendered])
+            risk = self.request.reason or "Tool requires confirmation"
+        if self.request.work_dir:
+            lines.extend(["", "Working directory:", f"  {self.request.work_dir}"])
+        if affected and tool_name not in {"WriteFile", "EditFile"}:
+            lines.extend(["", "Affected path:", f"  {affected}"])
+        lines.extend(
+            [
+                "",
+                "Risk:",
+                f"  {risk}",
+                f"Approval fingerprint: {self.request.argument_hash or '(legacy request)'}",
+            ]
+        )
+        return "\n".join(lines)
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option_list is not self.query_one(".inline-prompt-options", OptionList):
@@ -274,6 +352,12 @@ class InlinePermissionPrompt(Vertical):
 
     def action_deny(self) -> None:
         self._finish(PermissionResponse.DENY)
+
+    def action_allow(self) -> None:
+        self._finish(PermissionResponse.ALLOW)
+
+    def action_allow_always(self) -> None:
+        self._finish(PermissionResponse.ALLOW_ALWAYS)
 
 
 __all__ = ["InlinePermissionPrompt", "InlineQuestionPrompt"]

@@ -22,7 +22,7 @@
 - F5: `SessionRecord.from_message(message)` 把单条 `Message` 拆成一到多条 jsonl 记录（含 tool_use 内联到 assistant content blocks、tool_results 各自一条 `tool_result` 记录）。
 - F6: `Session.append(message)` 把 `from_message` 拆出的记录逐条写 jsonl + `\n` 并 `flush`；同步更新 `meta.message_count / last_active`；首条 user 消息截断到 `TITLE_MAX_LENGTH=50` 写入 `meta.title`；`Session.close()` 安全 `flush + close`。
 - F7: `SessionManager(work_dir)` lazy 创建 `<work_dir>/.mewcode/sessions/`；`create()` 用 `session_<YYYYMMDD_HHMMSS>_<4 字符 suffix>` 命名；`list()` 扫所有 `*.meta` 反序列化并按 `last_active` 倒序；`resume(id)` 读取 jsonl + meta、校验链路完整性、重建 `[Message]`、追加打开 jsonl 续写；`delete(id)` / `cleanup(max_age_days=30)` 维护清理。
-- F8: `records_to_messages(records)` 把 jsonl 记录序列还原成 `[Message]`：连续 tool_result 合并到下一条 user 消息的 `tool_results`、`assistant` content 为 list 时拆出 text + tool_uses、`system_prompt` 跳过、`compression` 渲染成 `[摘要]\n...` 的 user 消息。
+- F8: `records_to_messages(records)` 把 jsonl 记录序列还原成 `[Message]`：连续 tool_result 合并到下一条 user 消息的 `tool_results`、`assistant` content 为 list 时拆出 text + tool_uses、`system_prompt` 跳过；`compression` 作为追加式 checkpoint，清除此前已重建消息并渲染成 `[摘要]\n...` 的 user 消息。
 - F9: `validate_message_chain(records)` 扫描 tool_use ↔ tool_result 配对状态，返回链路完整的最大前缀长度；resume 时用该长度截断防止把缺少 tool_result 的 tool_use 灌回去触发 API 400。
 - F10: `build_time_gap_message(last_active)` 在距上次活跃 ≥ `TIME_GAP_THRESHOLD=24h` 时返回一条系统提示 `Message`（≥48 小时表达为「N 天」，否则「N 小时」），追加到恢复后的对话尾部提示用户「代码可能有变更」。
 

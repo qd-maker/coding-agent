@@ -9,6 +9,7 @@ from typing import ClassVar
 
 from pydantic import BaseModel, Field
 
+from mewcode.tools._file_support import resolve_tool_path
 from mewcode.tools.base import SKIP_DIRS, Tool, ToolResult
 
 
@@ -25,13 +26,19 @@ class Grep(Tool):
     category = "read"
     is_concurrency_safe = True
 
+    def __init__(self, work_dir: str | Path | None = None) -> None:
+        self.work_dir = Path(work_dir).resolve() if work_dir is not None else None
+
+    def set_work_dir(self, work_dir: str | Path) -> None:
+        self.work_dir = Path(work_dir).resolve()
+
     async def execute(self, params: Params) -> ToolResult:
         try:
             regex = re.compile(params.pattern)
         except re.error as exc:
             return ToolResult(f"Error: invalid regular expression: {exc}", is_error=True)
 
-        base = Path(params.path).expanduser()
+        base = resolve_tool_path(self.work_dir, params.path)
         if not base.exists():
             return ToolResult(f"Error: path not found: {base}", is_error=True)
         root = base if base.is_dir() else base.parent

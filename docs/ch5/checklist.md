@@ -21,7 +21,7 @@
 - [x] Agent.run 调用链：启动注入 environment，每轮构造 system prompt 并传给 client.stream
 - [x] Plan Mode 调用链：每轮构造 reminder 并通过 `conversation.add_system_reminder` 注入 user channel
 - [x] Compact 后恢复链重新注入 environment 与 long-term memory
-- [ ] 已记录差异（不在本章 must-fix）:
+- [x] 已记录差异（不在本章 must-fix）:
  - [x] Python 版本未实现 Reentry reminder；Exit reminder 已由 ch04 `/do` 使用，本章保持兼容
 
 ## 3. 编译与测试

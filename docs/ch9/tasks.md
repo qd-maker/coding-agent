@@ -39,7 +39,7 @@
 - 影响文件: `/Users/codemelo/mewcode/mewcode/memory/session.py:122-222`（`records_to_messages / validate_message_chain`）
 - 依赖任务: T3
 - 完成标准:
-  - `records_to_messages`：维护 `pending_tool_results` 队列，遇到非 tool_result 记录前先把队列冲到一条 user message 的 `tool_results`；system_prompt 跳过；compression 渲染为 `[摘要]\n<content>` 的 user message；assistant content list 时拆 text + tool_uses
+  - `records_to_messages`：维护 `pending_tool_results` 队列，遇到非 tool_result 记录前先把队列冲到一条 user message 的 `tool_results`；system_prompt 跳过；compression 作为 checkpoint 清除更早历史并渲染为 `[摘要]\n<content>`；assistant content list 时拆 text + tool_uses
   - `validate_message_chain`：维护 `pending_tool_uses set`，assistant content list 里 tool_use block 的 id 进集合，tool_result 出集合；集合为空时记录前缀长度，最后返回最大完整前缀
   - 测试 `TestRecordsToMessages`（3 个）+ `TestValidateMessageChain`（3 个）全部通过
 
@@ -113,3 +113,60 @@
   - 测试 `TestMemoryExtraction.test_extraction_prompt_contains_categories` 通过
 
 ## T11: `_write_memories` 分流 + 占位过滤
+- 影响文件: `mewcode/memory/auto_memory.py`（`_write_memories / _assign_section / _is_placeholder`）
+- 依赖任务: T9, T10
+- 完成标准:
+  - 只接收 `### ` 分类标题与 `- ` 条目，未知分类不落盘
+  - 用户偏好、纠正反馈写用户级；项目知识、参考资料写项目级
+  - 过滤空值、`... / … / 无 / 暂无 / N/A` 占位条目
+  - 创建父目录并以 UTF-8 覆盖式写入，空分类不写占位
+  - `clear / get_display_text / reset_cursor` 一并实现并由测试覆盖
+
+## T12: ConversationManager 独立上下文注入
+- 影响文件: `mewcode/conversation.py`
+- 依赖任务: T2, T9
+- 完成标准:
+  - 项目指令与自动记忆分别以 `## 项目指令`、`## 自动记忆` user message 注入
+  - 追加 assistant 确认消息封闭上下文边界
+  - 空输入不改变状态，同一历史幂等注入
+  - `replace_history` 重置 environment/LTM 标记，允许 compact/resume 后重新注入
+
+## T13: Agent 自动记忆生命周期
+- 影响文件: `mewcode/agent.py`
+- 依赖任务: T10, T12
+- 完成标准:
+  - `Agent` 接收 `instructions_content / memory_manager`
+  - 每次运行先注入 environment，再注入指令和记忆；compact 后重新注入
+  - 每 5 个完成回合 fire-and-forget 启动提取，不阻塞正常回答
+  - `_extracting` 防止并发重入，后台异常仅记录 debug
+  - `flush_memories(force=True)` 供应用退出时刷新最后增量
+
+## T14: `/memory` 与 `/session` 命令
+- 影响文件: `mewcode/commands/handlers/memory.py`、`mewcode/commands/handlers/session.py`、`mewcode/commands/handlers/__init__.py`
+- 依赖任务: T6, T7, T11
+- 完成标准:
+  - `/memory [list | clear | edit]` 支持展示、清空和定位双层文件
+  - `/session list` 最多列 10 条，`resume` 候选最多 15 条并支持序号
+  - `resume` 切换 Conversation/Agent/Session，补时间跨度提醒，超窗口先 compact
+  - `new` 安全关闭旧句柄并创建空历史，`delete` 禁止删除当前会话
+  - 未知子命令返回可执行 usage
+
+## T15: Textual App 主流程接入
+- 影响文件: `mewcode/app.py`
+- 依赖任务: T2, T6, T11, T13, T14
+- 完成标准:
+  - 启动加载指令与记忆，清理过期会话并创建当前 Session
+  - 用户消息立即追加 JSONL；tool round、重试和最终回答后补写未存消息
+  - 注入型临时消息不写会话存档，避免恢复后重复注入
+  - `/session` 恢复后重新渲染历史；退出关闭句柄并刷新自动记忆
+  - 空会话退出时删除空的 jsonl/meta，避免污染会话列表
+
+## T16: 自动化验收与文档同步
+- 影响文件: `tests/test_memory.py`、`tests/test_tui.py`、`README.md`、`docs/README.md`、`docs/ch9/checklist.md`
+- 依赖任务: T1-T15
+- 完成标准:
+  - 指令、include 边界、JSONL 往返、损坏恢复、链路截断、时间提示全部有测试
+  - 双层记忆、占位过滤、LLM 提取、注入幂等、命令生命周期全部有测试
+  - TUI 集成测试观测到指令注入、命令输出和 user/assistant JSONL
+  - `ruff / mypy / pytest` 全量通过后再勾选 checklist
+  - README 和章节索引只陈述已经验收的 CH2-CH9 能力

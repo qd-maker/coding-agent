@@ -3,21 +3,26 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 from pydantic import BaseModel
-from textual.widgets import Input, Markdown, Static
+from textual.widgets import Markdown, Static
 
 import mewcode.app as app_module
-from mewcode.app import ActivityLine, MewCodeApp, terminal_safe_text
+from mewcode.app import ActivityLine, MewCodeApp, PromptComposer, terminal_safe_text
 from mewcode.client import LLMClient
-from mewcode.config import AppConfig
-from mewcode.conversation import ConversationManager
+from mewcode.commands.completion import CompletionPopup
+from mewcode.config import AppConfig, MCPServerConfig
+from mewcode.conversation import ConversationManager, Message
+from mewcode.memory import SessionManager
 from mewcode.permission_dialog import InlinePermissionPrompt, InlineQuestionPrompt
 from mewcode.permissions import PermissionMode
+from mewcode.skills import SkillDependencyError
 from mewcode.tools.base import (
     StreamEnd,
     StreamEvent,
@@ -27,6 +32,7 @@ from mewcode.tools.base import (
     ToolCallStart,
     ToolResult,
 )
+from mewcode.tools.impl import ToolSearchParams, ToolSearchTool
 
 
 def app_config() -> AppConfig:
@@ -41,6 +47,23 @@ def app_config() -> AppConfig:
                 "thinking": True,
             }
         }
+    )
+
+
+@pytest.fixture(autouse=True)
+def isolate_tui_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Keep App-created sessions and plans out of the developer's working tree."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "mewcode.skills.loader.USER_SKILLS_DIR",
+        tmp_path / "isolated-user-skills",
+    )
+    monkeypatch.setattr(
+        "mewcode.agents.loader.USER_AGENTS_DIR",
+        tmp_path / "isolated-user-agents",
     )
 
 
@@ -73,6 +96,28 @@ class BlockingClient(LLMClient):
         super().__init__(config)
         self.started = asyncio.Event()
         self.release = asyncio.Event()
+        self.snapshots: list[list[Message]] = []
+
+    async def stream(
+        self,
+        conversation: ConversationManager,
+        system: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        del system, tools
+        self.snapshots.append(conversation.get_messages())
+        yield TextDelta("Hello")
+        self.started.set()
+        await self.release.wait()
+        yield StreamEnd("end_turn", 2, 2)
+
+
+class BurstClient(LLMClient):
+    def __init__(self, config: Any, count: int = 1000) -> None:
+        super().__init__(config)
+        self.count = count
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
 
     async def stream(
         self,
@@ -81,10 +126,33 @@ class BlockingClient(LLMClient):
         tools: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         del conversation, system, tools
-        yield TextDelta("Hello")
         self.started.set()
         await self.release.wait()
-        yield StreamEnd("end_turn", 2, 2)
+        for _ in range(self.count):
+            yield TextDelta("x")
+        yield StreamEnd("end_turn", 10, self.count)
+
+
+class ParallelToolClient(LLMClient):
+    def __init__(self, config: Any) -> None:
+        super().__init__(config)
+        self.calls = 0
+
+    async def stream(
+        self,
+        conversation: ConversationManager,
+        system: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        del conversation, system, tools
+        self.calls += 1
+        if self.calls == 1:
+            yield ToolCallComplete("glob-py", "Glob", {"pattern": "*.py", "path": "."})
+            yield ToolCallComplete("glob-md", "Glob", {"pattern": "*.md", "path": "."})
+            yield StreamEnd("tool_use", 4, 2)
+            return
+        yield TextDelta("Exploration complete.")
+        yield StreamEnd("end_turn", 5, 2)
 
 
 class DelayedEmojiClient(LLMClient):
@@ -108,6 +176,45 @@ class DelayedEmojiClient(LLMClient):
 
 class EmptyToolParams(BaseModel):
     pass
+
+
+class FakeMCPTool(Tool):
+    name = "mcp_context7_resolve_library_id"
+    description = "Resolve a library ID through Context7"
+    params_model = EmptyToolParams
+    category = "command"
+    should_defer = True
+
+    async def execute(self, params: EmptyToolParams) -> ToolResult:
+        del params
+        return ToolResult("resolved")
+
+
+class FakeMCPManager:
+    instances: list[FakeMCPManager] = []
+
+    def __init__(self) -> None:
+        self.configs: list[MCPServerConfig] = []
+        self.release = asyncio.Event()
+        self.registered = False
+        self.shutdown_called = False
+        self.instances.append(self)
+
+    def load_configs(self, configs: list[MCPServerConfig]) -> None:
+        self.configs = list(configs)
+
+    async def register_all_tools(self, registry: Any) -> list[str]:
+        await self.release.wait()
+        registry.register(FakeMCPTool())
+        self.registered = True
+        return []
+
+    @property
+    def connected_server_names(self) -> list[str]:
+        return [config.name for config in self.configs] if self.registered else []
+
+    async def shutdown(self) -> None:
+        self.shutdown_called = True
 
 
 class ControlledReadTool(Tool):
@@ -322,8 +429,8 @@ async def test_tui_shell_fits_80_by_24(monkeypatch: pytest.MonkeyPatch) -> None:
         assert "MewCode" in str(app.query_one("#product-line", Static).render())
         assert "claude-sonnet-4.6" in str(app.query_one("#model-line", Static).render())
         assert "Ready" in str(app.query_one("#connection", Static).render())
-        assert app.query_one("#prompt", Input).placeholder == 'Try "explain this project"'
-        assert app.focused is app.query_one("#prompt", Input)
+        assert "Shift+Enter newline" in str(app.query_one("#prompt", PromptComposer).placeholder)
+        assert app.focused is app.query_one("#prompt", PromptComposer)
         for selector in (
             "#welcome-panel",
             "#welcome-cat",
@@ -333,6 +440,170 @@ async def test_tui_shell_fits_80_by_24(monkeypatch: pytest.MonkeyPatch) -> None:
             "#statusbar",
         ):
             assert len(app.query(selector)) == 1
+
+
+@pytest.mark.asyncio
+async def test_tui_slash_commands_are_intercepted_before_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = app_config()
+    client = StreamingClient(config.provider)
+    monkeypatch.setattr(app_module, "create_client", lambda _: client)
+    app = MewCodeApp(config)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.press(*list("/status"), "enter")
+        await pilot.pause()
+        assert client.snapshots == []
+        assert "MewCode 状态" in str(app.query(".tool").last(Static).render())
+
+        await pilot.press(*list("/missing"), "enter")
+        await pilot.pause()
+        assert client.snapshots == []
+        assert "未知命令" in str(app.query(".tool").last(Static).render())
+
+
+@pytest.mark.asyncio
+async def test_tui_tab_completes_single_match_and_shows_multiple_matches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = app_config()
+    monkeypatch.setattr(app_module, "create_client", lambda _: StreamingClient(config.provider))
+    app = MewCodeApp(config)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        prompt = app.query_one("#prompt", PromptComposer)
+        await pilot.press(*list("/sta"), "tab")
+        await pilot.pause()
+        assert prompt.text == "/status "
+
+        prompt.load_text("/")
+        prompt.focus()
+        await pilot.press("tab")
+        await pilot.pause()
+        popup = app.query_one(CompletionPopup)
+        assert popup.is_visible
+
+
+@pytest.mark.asyncio
+async def test_tui_review_skill_runs_in_isolated_fork(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = app_config()
+    client = StreamingClient(config.provider)
+    monkeypatch.setattr(app_module, "create_client", lambda _: client)
+    app = MewCodeApp(config)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.press(*list("/review focus concurrency"), "enter")
+        await pilot.pause(0.2)
+        assert len(client.snapshots) == 1
+        submitted = "\n".join(message.content for message in client.snapshots[0])
+        assert "# Code Review SOP" in submitted
+        assert "Extra focus from the user: focus concurrency" in submitted
+        assert app.conversation.history == []
+        assert any(
+            "[review skill result]" in str(widget.render()) for widget in app.query(".tool")
+        )
+
+
+@pytest.mark.asyncio
+async def test_ch11_tui_catalog_inline_skill_and_clear(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = app_config()
+    client = StreamingClient(config.provider)
+    monkeypatch.setattr(app_module, "create_client", lambda _: client)
+    app = MewCodeApp(config)
+
+    async with app.run_test(size=(110, 36)) as pilot:
+        await pilot.press(*list("/help"), "enter")
+        await pilot.pause()
+        help_text = str(app.query(".tool").last(Static).render())
+        assert "/commit" in help_text and "[skill]" in help_text
+        assert "/review" in help_text and "/test" in help_text and "/skill" in help_text
+
+        await pilot.press(*list("/skill list"), "enter")
+        await pilot.pause()
+        assert "builtin" in str(app.query(".tool").last(Static).render())
+
+        await pilot.press(*list("/skill info commit"), "enter")
+        await pilot.pause()
+        assert "AllowedTools: Bash, ReadFile, Grep" in str(
+            app.query(".tool").last(Static).render()
+        )
+
+        await pilot.press(*list("/commit docs only"), "enter")
+        await pilot.pause(0.2)
+        assert "commit" in app.agent.active_skills
+        submitted = "\n".join(message.content for message in client.snapshots[-1])
+        assert "# Commit SOP" in submitted
+        assert "User request: docs only" in submitted
+
+        await pilot.press(*list("/clear"), "enter")
+        await pilot.pause()
+        assert app.agent.active_skills == {}
+        assert app.agent._active_allowed_tool_names() is None
+
+
+@pytest.mark.asyncio
+async def test_ch11_tui_hot_reloads_project_skill(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    skill_path = tmp_path / ".mewcode" / "skills" / "custom.md"
+    skill_path.parent.mkdir(parents=True)
+
+    def write(body: str) -> None:
+        skill_path.write_text(
+            "---\nname: custom\ndescription: Custom hot skill\n"
+            "allowedTools: []\nmode: inline\ncontext: full\n---\n" + body,
+            encoding="utf-8",
+        )
+
+    write("version one $ARGUMENTS")
+    config = app_config()
+    client = StreamingClient(config.provider)
+    monkeypatch.setattr(app_module, "create_client", lambda _: client)
+    app = MewCodeApp(config)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        write("version two $ARGUMENTS")
+        await pilot.press(*list("/custom refreshed"), "enter")
+        await pilot.pause(0.2)
+        assert app.agent.active_skills["custom"] == "version two refreshed"
+        assert "version two refreshed" in "\n".join(
+            message.content for message in client.snapshots[-1]
+        )
+
+
+def test_ch11_app_fails_fast_for_missing_skill_tool(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    skill_path = tmp_path / ".mewcode" / "skills" / "broken-dependency.md"
+    skill_path.parent.mkdir(parents=True)
+    skill_path.write_text(
+        "---\nname: broken-dependency\ndescription: Invalid dependency\n"
+        "allowedTools: [DefinitelyMissing]\nmode: inline\n---\nDo work",
+        encoding="utf-8",
+    )
+    config = app_config()
+    monkeypatch.setattr(app_module, "create_client", lambda _: StreamingClient(config.provider))
+    with pytest.raises(SkillDependencyError, match="DefinitelyMissing"):
+        MewCodeApp(config)
+
+
+def test_headless_permission_mode_can_change_before_screen_mount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = app_config()
+    monkeypatch.setattr(app_module, "create_client", lambda _: StreamingClient(config.provider))
+    app = MewCodeApp(config)
+
+    app.set_permission_mode(PermissionMode.BYPASS)
+
+    assert app.permission_mode is PermissionMode.BYPASS
 
 
 @pytest.mark.asyncio
@@ -352,9 +623,106 @@ async def test_tui_streams_reply_and_restores_composer(monkeypatch: pytest.Monke
         assert not app.query(".assistant")
         assert "Connected" in str(app.query_one("#connection", Static).render())
         assert "3 in / 4 out" in str(app.query_one("#model-status", Static).render())
-        prompt = app.query_one("#prompt", Input)
+        prompt = app.query_one("#prompt", PromptComposer)
         assert prompt.disabled is False
-        assert prompt.placeholder == 'Try "explain this project"'
+        assert "Shift+Enter newline" in str(prompt.placeholder)
+
+
+@pytest.mark.asyncio
+async def test_multiline_composer_history_and_submit(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = app_config()
+    client = StreamingClient(config.provider)
+    monkeypatch.setattr(app_module, "create_client", lambda _: client)
+    app = MewCodeApp(config)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        composer = app.query_one("#prompt", PromptComposer)
+        await pilot.press("f", "i", "r", "s", "t", "shift+enter", "s", "e", "c", "o", "n", "d")
+        assert composer.text == "first\nsecond"
+        await pilot.press("enter")
+        await pilot.pause(0.2)
+        assert client.snapshots[-1][-1].content == "first\nsecond"
+
+        await pilot.press("up")
+        assert composer.text == "first\nsecond"
+
+
+@pytest.mark.asyncio
+async def test_busy_composer_queues_and_runs_next_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = app_config()
+    client = BlockingClient(config.provider)
+    monkeypatch.setattr(app_module, "create_client", lambda _: client)
+    app = MewCodeApp(config)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.press(*list("first request"), "enter")
+        await asyncio.wait_for(client.started.wait(), timeout=1)
+        await pilot.press(*list("second request"), "enter")
+        await pilot.pause(0.1)
+        assert app._queued_prompts == ["second request"]
+        assert app.query_one("#prompt", PromptComposer).disabled is False
+
+        client.release.set()
+        await pilot.pause(0.35)
+        user_messages = [
+            message.content
+            for snapshot in client.snapshots
+            for message in snapshot
+            if message.role == "user" and message.content in {"first request", "second request"}
+        ]
+        assert "first request" in user_messages
+        assert "second request" in user_messages
+        assert app._queued_prompts == []
+
+
+@pytest.mark.asyncio
+async def test_streaming_burst_is_rendered_in_batches(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = app_config()
+    client = BurstClient(config.provider)
+    monkeypatch.setattr(app_module, "create_client", lambda _: client)
+    app = MewCodeApp(config)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.press(*list("burst"), "enter")
+        await asyncio.wait_for(client.started.wait(), timeout=1)
+        answer = app.query_one(".assistant", Static)
+        original_update = answer.update
+        updates = 0
+
+        def counted_update(content: Any = "") -> None:
+            nonlocal updates
+            updates += 1
+            original_update(content)
+
+        monkeypatch.setattr(answer, "update", counted_update)
+        client.release.set()
+        await pilot.pause(0.3)
+
+        assert updates < 50
+        assert len(app.query_one(".assistant-markdown", Markdown).source) == 1000
+
+
+@pytest.mark.asyncio
+async def test_parallel_tools_are_grouped_and_welcome_collapses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = app_config()
+    monkeypatch.setattr(app_module, "create_client", lambda _: ParallelToolClient(config.provider))
+    app = MewCodeApp(config)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        welcome = app.query_one("#welcome-panel")
+        assert not welcome.has_class("collapsed")
+
+        await pilot.press(*list("explore files"), "enter")
+        await pilot.pause(0.3)
+
+        assert welcome.has_class("collapsed")
+        assert len(app.query(".tool-batch")) == 1
+        assert len(app.query(".tool-batch .tool-card")) == 2
+        assert "Parallel tool batch" in str(
+            app.query_one(".tool-batch-title", Static).render()
+        )
 
 
 @pytest.mark.asyncio
@@ -389,7 +757,7 @@ async def test_thinking_animation_and_terminal_safe_status_emoji(
     app = MewCodeApp(config)
 
     async with app.run_test(size=(100, 30)) as pilot:
-        await pilot.press(*list("delete it"), "enter")
+        await pilot.press(*list("show the status icon"), "enter")
         await asyncio.wait_for(client.started.wait(), timeout=1)
         thinking = app.query_one(".thinking-label", ActivityLine)
         first_frame = str(thinking.render())
@@ -463,7 +831,7 @@ async def test_ctrl_c_cancels_an_active_generation(
 
         assert exit_calls == []
         assert "Cancelled" in str(app.query_one("#connection", Static).render())
-        assert app.query_one("#prompt", Input).disabled is False
+        assert app.query_one("#prompt", PromptComposer).disabled is False
 
 
 @pytest.mark.asyncio
@@ -623,7 +991,7 @@ async def test_tui_plan_and_do_commands_switch_permission_mode(
         assert "Accept Edits on" in str(app.query(".tool").last(Static).render())
         assert "Accept Edits on" in str(app.query_one("#mode-status", Static).render())
 
-        await pilot.press(*list("implement it"), "enter")
+        await pilot.press(*list("continue"), "enter")
         await pilot.pause(0.2)
         assert len(client.snapshots) == 2
         latest_history = "\n".join(message.content for message in client.snapshots[-1])
@@ -649,13 +1017,17 @@ async def test_tui_resolves_permission_request(monkeypatch: pytest.MonkeyPatch) 
                 break
         assert len(app.screen_stack) == 1
         permission = app.query_one(InlinePermissionPrompt)
-        assert "TestWrite" in str(permission.query_one(".inline-prompt-message", Static).render())
-        await pilot.press("down", "up", "enter")
+        summary = str(permission.query_one(".inline-prompt-message", Static).render())
+        assert "TestWrite" in summary
+        assert "Working directory" in summary
+        assert "Approval fingerprint" in summary
+        await pilot.press("y")
         await pilot.pause(0.2)
         assert "Permission: Allowed once" in str(
             permission.query_one(".inline-prompt-title", Static).render()
         )
         assert app.query_one(".assistant-markdown", Markdown).source == "Write approved."
+        assert "Completed with evidence" in str(app.query_one(".result-card", Static).render())
 
 
 @pytest.mark.asyncio
@@ -708,3 +1080,276 @@ async def test_tui_yolo_executes_command_without_permission_prompt(
         assert app.permission_mode is PermissionMode.BYPASS
         assert not app.query(".inline-permission-prompt")
         assert app.query_one(".assistant-markdown", Markdown).source == "Write approved."
+
+
+@pytest.mark.asyncio
+async def test_tui_initializes_mcp_on_tool_search_and_injects_reminder_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = app_config().model_copy(
+        update={
+            "mcp_servers": [MCPServerConfig(name="context7", command="npx")],
+        }
+    )
+    client = StreamingClient(config.provider)
+    FakeMCPManager.instances.clear()
+    monkeypatch.setattr(app_module, "create_client", lambda _: client)
+    monkeypatch.setattr(app_module, "MCPManager", FakeMCPManager)
+    app = MewCodeApp(config)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        manager = FakeMCPManager.instances[-1]
+        assert "MCP idle" in str(app.query_one("#connection", Static).render())
+        assert manager.registered is False
+
+        search = app.registry.get("ToolSearch")
+        assert isinstance(search, ToolSearchTool)
+        search_task = asyncio.create_task(
+            search.execute(ToolSearchParams(query="context7"))
+        )
+        await asyncio.sleep(0.05)
+        manager.release.set()
+        await search_task
+        await pilot.pause(0.1)
+        assert manager.registered is True
+        assert "Connected to 1 MCP server(s), 1 tools registered" in str(
+            app.query_one("#connection", Static).render()
+        )
+
+        await pilot.press(*list("first request"), "enter")
+        await pilot.pause(0.2)
+        await pilot.press(*list("second request"), "enter")
+        await pilot.pause(0.2)
+
+        assert len(client.snapshots) == 2
+        history = "\n".join(message.content for message in client.snapshots[-1])
+        assert history.count("MCP servers are connected") == 1
+        assert "Use ToolSearch to discover/select an MCP tool" in history
+        assert "mcp_context7_resolve_library_id" in history
+        assert "MCP 1/1 servers · 1 tools" in str(app.query_one("#connection", Static).render())
+
+    assert manager.shutdown_called is True
+
+
+@pytest.mark.asyncio
+async def test_first_message_does_not_wait_for_mcp_initialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = app_config().model_copy(
+        update={
+            "mcp_servers": [MCPServerConfig(name="context7", command="npx")],
+        }
+    )
+    client = StreamingClient(config.provider)
+    FakeMCPManager.instances.clear()
+    monkeypatch.setattr(app_module, "create_client", lambda _: client)
+    monkeypatch.setattr(app_module, "MCPManager", FakeMCPManager)
+    app = MewCodeApp(config)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        manager = FakeMCPManager.instances[-1]
+        await pilot.press(*list("ordinary question"), "enter")
+        await pilot.pause(0.25)
+        assert len(client.snapshots) == 1
+        assert manager.registered is False
+        assert app.query_one("#prompt", PromptComposer).disabled is False
+
+
+@pytest.mark.asyncio
+async def test_ch9_tui_loads_instructions_persists_and_exposes_commands(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "MEWCODE.md").write_text("Always run tests.", encoding="utf-8")
+    config = app_config()
+    client = StreamingClient(config.provider)
+    monkeypatch.setattr(app_module, "create_client", lambda _: client)
+    app = MewCodeApp(config)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        session_id = app.session.id
+        await pilot.press(*list("hello"), "enter")
+        await pilot.pause(0.25)
+        assert any(
+            message.content == "## 项目指令\nAlways run tests." for message in client.snapshots[0]
+        )
+
+        await pilot.press(*list("/session list"), "enter")
+        await pilot.pause()
+        assert any("最近会话" in str(widget.render()) for widget in app.query(".tool"))
+
+        await pilot.press(*list("/memory edit"), "enter")
+        await pilot.pause()
+        assert any("memories.md" in str(widget.render()) for widget in app.query(".tool"))
+
+    jsonl = tmp_path / ".mewcode" / "sessions" / f"{session_id}.jsonl"
+    payloads = [json.loads(line) for line in jsonl.read_text(encoding="utf-8").splitlines()]
+    assert [payload["type"] for payload in payloads] == ["user", "assistant"]
+    assert payloads[0]["content"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_headless_runtime_runs_hooks_and_persists_session(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    raw_config = app_config().model_dump(by_alias=True)
+    raw_config["hooks"] = [
+        {
+            "id": "headless-startup",
+            "event": "startup",
+            "action": {"type": "prompt", "message": "headless startup observed"},
+        },
+        {
+            "id": "headless-shutdown",
+            "event": "shutdown",
+            "action": {"type": "prompt", "message": "headless shutdown observed"},
+        },
+    ]
+    config = AppConfig.model_validate(raw_config)
+    client = StreamingClient(config.provider)
+    monkeypatch.setattr(app_module, "create_client", lambda _: client)
+    app = MewCodeApp(config)
+    session_id = app.session.id
+
+    await app.start_headless()
+    result = await app.agent.run_to_completion("headless request")
+    await app.shutdown_headless()
+
+    assert result == "## Hello\n\n- from MewCode"
+    assert app.session.closed is True
+    assert "headless startup observed" in app.agent.hook_prompts
+    assert "headless shutdown observed" in app.agent.hook_prompts
+    restored = SessionManager(tmp_path).resume(session_id)
+    assert restored is not None
+    assert [message.content for message in restored.messages] == [
+        "headless request",
+        "## Hello\n\n- from MewCode",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ch9_tui_resumes_and_renders_archived_session(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    manager = SessionManager(tmp_path)
+    archived = manager.create()
+    archived.append(Message("user", "old request"))
+    archived.append(Message("assistant", "old answer"))
+    archived.meta.last_active = datetime.now(UTC) - timedelta(hours=25)
+    archived.meta.save(archived.meta_path)
+    archived_id = archived.id
+    archived.close()
+
+    config = app_config()
+    monkeypatch.setattr(
+        app_module,
+        "create_client",
+        lambda _: StreamingClient(config.provider),
+    )
+    app = MewCodeApp(config)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.press(*list(f"/session resume {archived_id}"), "enter")
+        await pilot.pause(0.1)
+        assert app.session.id == archived_id
+        assert any(message.content == "old request" for message in app.conversation.history)
+        assert any("25 小时" in message.content for message in app.conversation.history)
+        assert "old request" in str(app.query_one(".user-text", Static).render())
+        assert app.query_one(".assistant-markdown", Markdown).source == "old answer"
+
+
+@pytest.mark.asyncio
+async def test_ch12_tui_runs_startup_command_and_shutdown_hooks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_config = app_config().model_dump(by_alias=True)
+    raw_config["hooks"] = [
+        {
+            "id": "startup-context",
+            "event": "startup",
+            "action": {"type": "prompt", "message": "startup injected"},
+        },
+        {
+            "id": "command-context",
+            "event": "command_execute",
+            "condition": 'args.name == "status"',
+            "action": {"type": "prompt", "message": "status command observed"},
+        },
+        {
+            "id": "shutdown-context",
+            "event": "shutdown",
+            "action": {"type": "prompt", "message": "shutdown observed"},
+        },
+    ]
+    config = AppConfig.model_validate(raw_config)
+    monkeypatch.setattr(
+        app_module,
+        "create_client",
+        lambda _: StreamingClient(config.provider),
+    )
+    app = MewCodeApp(config)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        assert "startup injected" in app.agent.hook_prompts
+        await pilot.press(*list("/status"), "enter")
+        await pilot.pause()
+        assert "status command observed" in app.agent.hook_prompts
+
+    assert "shutdown observed" in app.agent.hook_prompts
+
+
+@pytest.mark.asyncio
+async def test_ch13_tui_registers_agents_commands_and_injects_task_notification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = app_config()
+    monkeypatch.setattr(
+        app_module,
+        "create_client",
+        lambda _: StreamingClient(config.provider),
+    )
+    app = MewCodeApp(config)
+
+    class QuickAgent:
+        agent_id = "quick-agent"
+        total_input_tokens = 9
+        total_output_tokens = 4
+
+        async def run_to_completion(
+            self,
+            prompt: str,
+            conversation: ConversationManager | None = None,
+        ) -> str:
+            del prompt, conversation
+            await asyncio.sleep(0)
+            return "background complete"
+
+    assert app.registry.get("Agent") is app.agent_tool
+    assert app.command_registry.find("tasks") is not None
+    assert app.command_registry.find("task") is not None
+    assert app.command_registry.find("trace") is not None
+    assert {item.agent_type for item in app.agent_loader.list_agents()} >= {
+        "Explore",
+        "Plan",
+        "general-purpose",
+    }
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        node = app.trace_registry.create("Explore", app.agent.agent_id)
+        await app.task_manager.launch(
+            QuickAgent(),  # type: ignore[arg-type]
+            "scan",
+            agent_type="Explore",
+            description="background scan",
+            trace_node=node,
+        )
+        await pilot.pause(0.35)
+        assert any(
+            "<task-notification>" in message.content
+            for message in app.conversation.history
+        )
+        assert await app._dispatch_command("/tasks") is True
+        assert any("background scan" in str(widget.render()) for widget in app.query(".tool"))

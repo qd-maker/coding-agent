@@ -75,7 +75,7 @@ class PermissionChecker:
         if self.mode is PermissionMode.BYPASS:
             return Decision("allow", f"权限模式 {self.mode.value} 放行")
 
-        rule_effect = self.rule_engine.evaluate(tool.name, content)
+        rule_effect = self.rule_engine.evaluate(tool.name, content, arguments)
         if rule_effect == "allow":
             return Decision("allow", "权限规则放行")
         if rule_effect == "deny":

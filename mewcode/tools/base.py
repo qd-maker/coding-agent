@@ -18,6 +18,11 @@ ToolCategory = Literal["read", "write", "command"]
 class ToolResult:
     output: str
     is_error: bool = False
+    data: dict[str, Any] | None = None
+    preview: str | None = None
+    artifact_path: str | None = None
+    exit_code: int | None = None
+    diagnostics: tuple[str, ...] = ()
 
 
 class Tool(ABC):

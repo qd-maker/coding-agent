@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 from mewcode.agent import (
     Agent,
+    ErrorEvent,
     PermissionRequest,
     PermissionResponse,
     StreamText,
@@ -33,6 +34,7 @@ from mewcode.permissions import (
     is_safe_command,
     mode_decide,
     parse_rule,
+    permission_argument_hash,
 )
 from mewcode.permissions.rules import _load_rules_file
 from mewcode.tools import create_default_registry
@@ -407,7 +409,12 @@ def tool_round(tool_id: str, tool_name: str, arguments: dict[str, Any]) -> list[
 @pytest.mark.asyncio
 async def test_e2e_dangerous_command_blocked_loop_continues(tmp_path: Path) -> None:
     client = ScriptedClient(
-        [tool_round("danger", "Bash", {"command": "rm -rf /"}), [TextDelta("Recovered")]]
+        [
+            tool_round("danger", "Bash", {"command": "rm -rf /"}),
+            [TextDelta("Recovered")],
+            [TextDelta("Still blocked")],
+            [TextDelta("Unable to execute safely")],
+        ]
     )
     agent = Agent(
         client,
@@ -421,6 +428,10 @@ async def test_e2e_dangerous_command_blocked_loop_continues(tmp_path: Path) -> N
     assert result.is_error is True
     assert "危险命令拦截" in result.detail
     assert any(isinstance(event, StreamText) and event.text == "Recovered" for event in events)
+    assert any(
+        isinstance(event, ErrorEvent) and "verification failed" in event.message.casefold()
+        for event in events
+    )
 
 
 @pytest.mark.asyncio
@@ -496,10 +507,71 @@ async def test_e2e_default_mode_write_triggers_ask_and_learns(tmp_path: Path) ->
             event.future.set_result(PermissionResponse.ALLOW_ALWAYS)
 
     requests = [event for event in events if isinstance(event, PermissionRequest)]
-    assert len(requests) == 1
+    assert len(requests) == 2
     assert target.read_text(encoding="utf-8") == "two"
-    assert checker.rule_engine.evaluate("WriteFile", str(target)) == "allow"
-    assert "WriteFile(" in local_rules.read_text(encoding="utf-8")
+    assert checker.rule_engine.evaluate(
+        "WriteFile",
+        str(target),
+        {"file_path": str(target), "content": "two"},
+    ) == "allow"
+    saved_rules = local_rules.read_text(encoding="utf-8")
+    assert "WriteFile(" in saved_rules
+    assert "arguments_hash:" in saved_rules
+
+
+@pytest.mark.asyncio
+async def test_allow_always_is_exact_and_argument_change_asks_again(tmp_path: Path) -> None:
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    checker = make_checker(tmp_path, rules=RuleEngine(tmp_path / "permissions.local.yaml"))
+    client = ScriptedClient(
+        [
+            tool_round("write-1", "WriteFile", {"file_path": str(first), "content": "one"}),
+            tool_round("write-2", "WriteFile", {"file_path": str(second), "content": "two"}),
+            [TextDelta("Written")],
+        ]
+    )
+    agent = Agent(
+        client,
+        registry=create_default_registry(work_dir=tmp_path),
+        work_dir=tmp_path,
+        permission_checker=checker,
+    )
+
+    requests: list[PermissionRequest] = []
+    async for event in agent.run("write two files"):
+        if isinstance(event, PermissionRequest):
+            requests.append(event)
+            event.future.set_result(PermissionResponse.ALLOW_ALWAYS)
+
+    assert len(requests) == 2
+    assert requests[0].argument_hash != requests[1].argument_hash
+    assert checker.rule_engine.evaluate(
+        "WriteFile",
+        str(first),
+        {"file_path": str(first), "content": "one"},
+    ) == "allow"
+    assert checker.rule_engine.evaluate(
+        "WriteFile",
+        str(second),
+        {"file_path": str(second), "content": "two"},
+    ) == "allow"
+
+
+def test_exact_permission_rule_does_not_expand_wildcard_characters() -> None:
+    rule = Rule("Bash", "echo *", match_mode="exact")
+
+    assert rule.matches("Bash", "echo *") is True
+    assert rule.matches("Bash", "echo anything") is False
+
+
+def test_permission_argument_hash_binds_tool_and_normalizes_command() -> None:
+    first = permission_argument_hash("Bash", {"command": "echo   hello"})
+    equivalent = permission_argument_hash("Bash", {"command": " echo hello "})
+    other_tool = permission_argument_hash("WriteFile", {"command": "echo hello"})
+
+    assert first == equivalent
+    assert first != other_tool
 
 
 @pytest.mark.asyncio
@@ -537,6 +609,8 @@ async def test_e2e_user_denies_operation(tmp_path: Path) -> None:
                 {"file_path": str(target), "content": "must not exist"},
             ),
             [TextDelta("Denied")],
+            [TextDelta("Still unable to continue")],
+            [TextDelta("No permitted alternative")],
         ]
     )
     agent = Agent(
