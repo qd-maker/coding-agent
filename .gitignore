@@ -1,0 +1,25 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+/.pytest-*/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+simplecode.yaml
+*.egg-info/
+dist/
+build/
+.simplecode/
+/plan/
+/hello.txt
+/poem.txt
+/.claude/
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+graft/
+
+# Separately-cloned upstream repo with its own .git; committing it would only
+# leave a broken gitlink. Clone it yourself, or add it back as a submodule.
+/nuphus-mcp/
